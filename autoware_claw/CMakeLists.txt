@@ -14,9 +14,10 @@ install(PROGRAMS
   RENAME autoware_mcp_server
 )
 
-# ── Config / Launch ──
+# ── Config / Launch / Docker runtime ──
 install(DIRECTORY config/ DESTINATION share/${PROJECT_NAME}/config)
 install(DIRECTORY launch/ DESTINATION share/${PROJECT_NAME}/launch)
+install(FILES docker-compose.yml DESTINATION share/${PROJECT_NAME}/docker)
 
 # ── Docker container build (NemoClaw + Ollama) ──
 option(BUILD_DOCKER "Build/pull Docker containers for NemoClaw" ON)
