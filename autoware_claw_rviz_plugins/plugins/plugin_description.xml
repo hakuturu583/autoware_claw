@@ -1,0 +1,7 @@
+<library path="autoware_claw_rviz_plugins">
+  <class
+    type="autoware_claw_rviz_plugins::AutowareClawPanel"
+    base_class_type="rviz_common::Panel">
+    <description>Chat panel for interacting with OpenClaw/NemoClaw autonomous driving assistant via Autoware MCP bridge</description>
+  </class>
+</library>
