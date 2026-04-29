@@ -1,0 +1,20 @@
+/**:
+  ros__parameters:
+    # MCP server
+    transport: "sse"
+    host: "127.0.0.1"
+    port: 8765
+
+    # Heartbeat for vehicle_cmd_gate external input
+    heartbeat_rate_hz: 20.0
+
+    # Vehicle parameters (override from vehicle_info if needed)
+    wheelbase_m: 2.79
+    max_steering_rad: 1.0
+    max_velocity_mps: 25.0
+
+    # Lanelet2 map (for coordinate resolver)
+    map_path: ""
+    map_origin_lat: 0.0
+    map_origin_lon: 0.0
+    map_origin_alt: 0.0

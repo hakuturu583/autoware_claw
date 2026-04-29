@@ -1,0 +1,29 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Network policy addition for Autoware MCP endpoint.
+# Applied on top of NemoClaw's base sandbox policy to allow the OpenClaw
+# agent to reach the Autoware MCP SSE server running on the host.
+#
+# The MCP server listens on 127.0.0.1:8765 (host), exposed to Docker
+# via host.docker.internal. This policy restricts access to the specific
+# port and HTTP methods used by MCP JSON-RPC over SSE.
+#
+# Apply via: openshell policy set --additions autoware-mcp-policy.yaml
+# Or bake into the blueprint at build time.
+
+autoware_mcp:
+  name: autoware_mcp
+  endpoints:
+    # MCP SSE endpoint on host — vehicle state + control tools
+    - host: host.docker.internal
+      port: 8765
+      protocol: rest
+      enforcement: enforce
+      rules:
+        - allow: { method: GET, path: "/sse" }            # SSE stream
+        - allow: { method: POST, path: "/messages/" }      # JSON-RPC requests
+        - allow: { method: POST, path: "/messages/**" }    # JSON-RPC requests
+        - allow: { method: GET, path: "/health" }          # Health check
+  binaries:
+    - { path: /usr/local/bin/openclaw }
+    - { path: /usr/local/bin/node }
