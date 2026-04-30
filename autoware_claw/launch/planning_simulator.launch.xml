@@ -1,0 +1,88 @@
+<launch>
+  <!-- autoware_claw: wraps Autoware planning_simulator with NemoClaw integration -->
+
+  <!-- ── Autoware planning_simulator args (forwarded as-is) ── -->
+  <arg name="map_path" description="point cloud and lanelet2 map directory path"/>
+  <arg name="vehicle_model" default="sample_vehicle" description="vehicle model name"/>
+  <arg name="sensor_model" default="sample_sensor_kit" description="sensor model name"/>
+  <arg name="data_path" default="$(env HOME)/autoware_data" description="packages data and artifacts directory path"/>
+
+  <arg name="planning_module_preset" default="default"/>
+  <arg name="control_module_preset" default="default"/>
+  <arg name="lanelet2_map_file" default="lanelet2_map.osm"/>
+  <arg name="pointcloud_map_file" default="pointcloud_map.pcd"/>
+  <arg name="launch_dummy_doors" default="true"/>
+  <arg name="launch_system_monitor" default="false"/>
+  <arg name="launch_dummy_diag_publisher" default="true"/>
+  <arg name="initial_engage_state" default="true"/>
+  <arg name="perception/enable_detection_failure" default="true"/>
+  <arg name="perception/enable_object_recognition" default="true"/>
+  <arg name="perception/enable_traffic_light" default="false"/>
+  <arg name="perception/use_base_link_z" default="true"/>
+  <arg name="sensing/visible_range" default="300.0"/>
+  <arg name="scenario_simulation" default="false"/>
+  <arg name="vehicle_simulation" default="true"/>
+  <arg name="enable_all_modules_auto_mode" default="$(var scenario_simulation)"/>
+  <arg name="use_sim_time" default="$(var scenario_simulation)"/>
+  <arg name="localization_sim_mode" default="api"/>
+
+  <!-- ── RViz (override default to autoware_claw config) ── -->
+  <arg name="rviz" default="true" description="launch rviz"/>
+  <arg name="rviz_config" default="$(find-pkg-share autoware_claw_rviz_plugins)/rviz/autoware_claw.rviz" description="rviz config with Claw panel"/>
+
+  <!-- ── autoware_claw settings ── -->
+  <arg name="launch_claw" default="true" description="launch autoware_claw MCP server"/>
+  <arg name="launch_nemoclaw_docker" default="true" description="start NemoClaw + Ollama containers via docker compose"/>
+  <arg name="mcp_config_file" default="$(find-pkg-share autoware_claw)/config/mcp_server.param.yaml"/>
+  <arg name="mcp_transport" default="sse"/>
+  <arg name="mcp_port" default="8765"/>
+  <arg name="mcp_host" default="127.0.0.1"/>
+
+  <!-- ── 1. Autoware planning_simulator ── -->
+  <include file="$(find-pkg-share autoware_launch)/launch/planning_simulator.launch.xml">
+    <arg name="map_path" value="$(var map_path)"/>
+    <arg name="vehicle_model" value="$(var vehicle_model)"/>
+    <arg name="sensor_model" value="$(var sensor_model)"/>
+    <arg name="data_path" value="$(var data_path)"/>
+    <arg name="planning_module_preset" value="$(var planning_module_preset)"/>
+    <arg name="control_module_preset" value="$(var control_module_preset)"/>
+    <arg name="lanelet2_map_file" value="$(var lanelet2_map_file)"/>
+    <arg name="pointcloud_map_file" value="$(var pointcloud_map_file)"/>
+    <arg name="launch_dummy_doors" value="$(var launch_dummy_doors)"/>
+    <arg name="launch_system_monitor" value="$(var launch_system_monitor)"/>
+    <arg name="launch_dummy_diag_publisher" value="$(var launch_dummy_diag_publisher)"/>
+    <arg name="initial_engage_state" value="$(var initial_engage_state)"/>
+    <arg name="perception/enable_detection_failure" value="$(var perception/enable_detection_failure)"/>
+    <arg name="perception/enable_object_recognition" value="$(var perception/enable_object_recognition)"/>
+    <arg name="perception/enable_traffic_light" value="$(var perception/enable_traffic_light)"/>
+    <arg name="perception/use_base_link_z" value="$(var perception/use_base_link_z)"/>
+    <arg name="sensing/visible_range" value="$(var sensing/visible_range)"/>
+    <arg name="scenario_simulation" value="$(var scenario_simulation)"/>
+    <arg name="vehicle_simulation" value="$(var vehicle_simulation)"/>
+    <arg name="enable_all_modules_auto_mode" value="$(var enable_all_modules_auto_mode)"/>
+    <arg name="use_sim_time" value="$(var use_sim_time)"/>
+    <arg name="localization_sim_mode" value="$(var localization_sim_mode)"/>
+    <arg name="rviz" value="$(var rviz)"/>
+    <arg name="rviz_config" value="$(var rviz_config)"/>
+  </include>
+
+  <!-- ── 2. Autoware MCP Server ── -->
+  <group if="$(var launch_claw)">
+    <include file="$(find-pkg-share autoware_claw)/launch/mcp_server.launch.xml">
+      <arg name="config_file" value="$(var mcp_config_file)"/>
+      <arg name="transport" value="$(var mcp_transport)"/>
+      <arg name="port" value="$(var mcp_port)"/>
+      <arg name="host" value="$(var mcp_host)"/>
+    </include>
+  </group>
+
+  <!-- ── 3. NemoClaw + Ollama Docker containers ── -->
+  <group if="$(var launch_nemoclaw_docker)">
+    <executable
+      cmd="docker compose -p autoware_claw -f $(find-pkg-share autoware_claw)/docker/docker-compose.yml up --no-build --abort-on-container-exit"
+      name="nemoclaw_docker"
+      output="screen"
+      shell="true"
+    />
+  </group>
+</launch>

@@ -13,16 +13,48 @@ services:
     networks:
       - internal-net
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:11434/api/tags"]
+      # Only healthy once gemma4 model is pulled and ready to serve
+      test: ["CMD-SHELL", "curl -sf http://localhost:11434/api/tags | grep -q gemma4"]
       interval: 10s
       timeout: 5s
-      retries: 5
+      retries: 30
+      start_period: 60s
     entrypoint: >
-      bash -c "ollama serve &
-      sleep 5 && ollama pull gemma4 &&
-      wait"
+      bash -c "
+        ollama serve &
+        OLLAMA_PID=$$!;
+        for i in $$(seq 1 30); do
+          curl -sf http://localhost:11434/api/tags >/dev/null 2>&1 && break;
+          sleep 2;
+        done;
+        echo '[autoware_claw] Pulling gemma4 model (skipped if already cached in volume)...';
+        ollama pull gemma4;
+        echo '[autoware_claw] gemma4 ready.';
+        wait $$OLLAMA_PID
+      "
+
+  # One-shot service: pull gemma4 weights into ollama-data volume during colcon build.
+  # Uses "setup" profile so it does NOT start with normal `docker compose up`.
+  # No GPU required — just downloads model files.
+  ollama-pull:
+    image: ollama/ollama:latest
+    profiles: ["setup"]
+    volumes:
+      - ollama-data:/root/.ollama
+    entrypoint: >
+      bash -c "
+        ollama serve &
+        for i in $$(seq 1 30); do
+          curl -sf http://localhost:11434/api/tags >/dev/null 2>&1 && break;
+          sleep 2;
+        done;
+        echo '[autoware_claw] Pulling gemma4 into ollama-data volume...';
+        ollama pull gemma4;
+        echo '[autoware_claw] gemma4 cached. Subsequent startups will skip download.';
+      "
 
   nemoclaw:
+    image: autoware_claw-nemoclaw:latest
     build:
       context: .
       dockerfile: docker/nemoclaw.Dockerfile

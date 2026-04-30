@@ -26,6 +26,9 @@
   <exec_depend>geometry_msgs</exec_depend>
   <exec_depend>std_msgs</exec_depend>
   <!-- rosclaw, mcp are installed via pip -->
+  <!-- autoware_launch and autoware_claw_rviz_plugins are runtime deps resolved via
+       find-pkg-share in launch files; not declared as exec_depend to avoid pulling
+       the entire Autoware dependency graph (incl. CUDA perception packages) at build time. -->
   <!-- NemoClaw (LLM agent) runs inside Docker for network security -->
 
   <test_depend>ament_lint_auto</test_depend>
