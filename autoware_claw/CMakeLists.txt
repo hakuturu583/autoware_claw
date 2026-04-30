@@ -37,7 +37,7 @@ if(BUILD_DOCKER)
     # Step 1: Build Docker images (NemoClaw + Ollama)
     add_custom_command(
       OUTPUT ${_docker_stamp}
-      COMMAND ${DOCKER_CMD} compose -f ${CMAKE_CURRENT_SOURCE_DIR}/docker-compose.yml build
+      COMMAND ${DOCKER_CMD} compose -p autoware_claw -f ${CMAKE_CURRENT_SOURCE_DIR}/docker-compose.yml build
       COMMAND ${CMAKE_COMMAND} -E touch ${_docker_stamp}
       DEPENDS ${_docker_sources}
       WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
@@ -47,7 +47,7 @@ if(BUILD_DOCKER)
     # Step 2: Pull gemma4 model weights into ollama-data volume (one-shot, cached)
     add_custom_command(
       OUTPUT ${_model_stamp}
-      COMMAND ${DOCKER_CMD} compose -f ${CMAKE_CURRENT_SOURCE_DIR}/docker-compose.yml
+      COMMAND ${DOCKER_CMD} compose -p autoware_claw -f ${CMAKE_CURRENT_SOURCE_DIR}/docker-compose.yml
               --profile setup run --rm -T ollama-pull
       COMMAND ${CMAKE_COMMAND} -E touch ${_model_stamp}
       DEPENDS ${_docker_stamp}

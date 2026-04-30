@@ -54,6 +54,7 @@ services:
       "
 
   nemoclaw:
+    image: autoware_claw-nemoclaw:latest
     build:
       context: .
       dockerfile: docker/nemoclaw.Dockerfile
