@@ -34,6 +34,8 @@ class AutowareMCPServer:
         openai_api_key: str = "",
         openai_base_url: str = "https://api.openai.com/v1",
         openai_model: str = "gpt-4.1",
+        # Google Maps API (Geocoding + Roads)
+        google_maps_api_key: str = "",
         # # Ollama (commented out — gemma4 does not support function calling)
         # ollama_url: str = "http://127.0.0.1:11435",
         # ollama_model: str = "gemma4",
@@ -46,6 +48,7 @@ class AutowareMCPServer:
         self._openai_api_key = openai_api_key
         self._openai_base_url = openai_base_url.rstrip("/")
         self._openai_model = openai_model
+        self._google_maps_api_key = google_maps_api_key
         # # Ollama (commented out)
         # self._ollama_url = ollama_url
         # self._ollama_model = ollama_model
@@ -54,20 +57,27 @@ class AutowareMCPServer:
         self._nemoclaw_token = nemoclaw_token
         self._register_tools()
 
-    def init_coordinate_resolver(
-        self, map_path: str, lat: float, lon: float, alt: float = 0.0
-    ) -> bool:
-        """Initialize lanelet2 map for coordinate resolution."""
-        if not map_path:
-            self._node.get_logger().warn("No map_path configured — coordinate resolver disabled")
-            return False
-        try:
-            self._coord_resolver = CoordinateResolver(map_path, lat, lon, alt)
-            self._node.get_logger().info(f"Coordinate resolver loaded: {map_path}")
-            return True
-        except Exception as e:
-            self._node.get_logger().error(f"Failed to load lanelet2 map: {e}")
-            return False
+    def init_coordinate_resolver_from_topic(self) -> None:
+        """Register callback to initialize coordinate resolver when vector map arrives."""
+        def _on_map(data: bytes) -> None:
+            if self._coord_resolver is not None:
+                return  # already initialized
+            try:
+                self._coord_resolver = CoordinateResolver.from_bin_data(data)
+                self._node.get_logger().info(
+                    "Coordinate resolver initialized from /map/vector_map"
+                )
+            except Exception as e:
+                self._node.get_logger().error(
+                    f"Failed to initialize coordinate resolver: {e}"
+                )
+
+        # If map already available, use it immediately
+        existing = self._node.get_vector_map_bin()
+        if existing:
+            _on_map(existing)
+        # Also register for future updates
+        self._node.set_on_vector_map_callback(_on_map)
 
     # ──────────────────────────────────────────────
     # Tool registration
@@ -490,34 +500,82 @@ class AutowareMCPServer:
     # ──────────────────────────────────────────────
 
     async def _geocode(self, query: str) -> dict:
-        """Geocode a place name to lat/lon using Nominatim (OpenStreetMap)."""
+        """Geocode a place name to lat/lon using Google Maps Geocoding API,
+        then snap to nearest road via Roads API."""
         import httpx
 
         logger = self._node.get_logger()
-        logger.info(f"[geocode] Resolving: {query}")
+        logger.info(f"[geocode] Resolving via Google Maps: {query}")
+
+        if not self._google_maps_api_key:
+            return {"error": "GOOGLE_MAPS_API_KEY is not configured"}
+
         try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                resp = await client.get(
-                    "https://nominatim.openstreetmap.org/search",
-                    params={"q": query, "format": "json", "limit": 3, "accept-language": "ja"},
-                    headers={"User-Agent": "autoware-claw/1.0"},
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                # 1. Geocode: place name -> lat/lon
+                geo_resp = await client.get(
+                    "https://maps.googleapis.com/maps/api/geocode/json",
+                    params={
+                        "address": query,
+                        "language": "ja",
+                        "key": self._google_maps_api_key,
+                    },
                 )
-                results = resp.json()
-                if results:
-                    top = results[0]
+                geo_resp.raise_for_status()
+                geo_data = geo_resp.json()
+
+                if geo_data.get("status") != "OK" or not geo_data.get("results"):
+                    return {"error": f"Geocoding failed: {geo_data.get('status', 'no results')}"}
+
+                top = geo_data["results"][0]
+                location = top["geometry"]["location"]
+                lat = location["lat"]
+                lon = location["lng"]
+                display_name = top.get("formatted_address", query)
+                logger.info(f"[geocode] Geocoded: {display_name} ({lat}, {lon})")
+
+                # 2. Snap to nearest road via Roads API
+                roads_resp = await client.get(
+                    "https://roads.googleapis.com/v1/nearestRoads",
+                    params={
+                        "points": f"{lat},{lon}",
+                        "key": self._google_maps_api_key,
+                    },
+                )
+                roads_resp.raise_for_status()
+                roads_data = roads_resp.json()
+
+                snapped = roads_data.get("snappedPoints", [])
+                if snapped:
+                    snapped_loc = snapped[0]["location"]
+                    snapped_lat = snapped_loc["latitude"]
+                    snapped_lon = snapped_loc["longitude"]
+                    place_id = snapped[0].get("placeId", "")
                     logger.info(
-                        f"[geocode] Found: {top.get('display_name', '')} "
-                        f"({top['lat']}, {top['lon']})"
+                        f"[geocode] Snapped to road: ({snapped_lat}, {snapped_lon}) "
+                        f"placeId={place_id}"
                     )
                     return {
-                        "lat": float(top["lat"]),
-                        "lon": float(top["lon"]),
-                        "display_name": top.get("display_name", ""),
+                        "lat": snapped_lat,
+                        "lon": snapped_lon,
+                        "original_lat": lat,
+                        "original_lon": lon,
+                        "snapped_to_road": True,
+                        "place_id": place_id,
+                        "display_name": display_name,
                     }
-                return {"error": f"Could not find location: {query}"}
+
+                # Roads API returned no snapped points — return raw geocode result
+                logger.info("[geocode] No nearby road found, returning raw geocode result")
+                return {
+                    "lat": lat,
+                    "lon": lon,
+                    "snapped_to_road": False,
+                    "display_name": display_name,
+                }
         except Exception as e:
-            logger.error(f"[geocode] Error: {e}")
-            return {"error": f"Geocoding failed: {e}"}
+            logger.error(f"[geocode] Google Maps API error: {e}")
+            return {"error": f"Google Maps API failed: {e}"}
 
     def _build_openai_tools(self) -> list[dict]:
         """Build OpenAI function-calling tool definitions."""
@@ -536,7 +594,8 @@ class AutowareMCPServer:
             "function": {
                 "name": "geocode",
                 "description": (
-                    "Convert a place name or address to latitude and longitude. "
+                    "Convert a place name or address to latitude and longitude, "
+                    "snapped to the nearest road via Google Maps Roads API. "
                     "Use this when the user mentions a destination by name."
                 ),
                 "parameters": {
@@ -910,10 +969,6 @@ def main():
     node.declare_parameter("transport", "sse")
     node.declare_parameter("host", "0.0.0.0")
     node.declare_parameter("port", 8765)
-    node.declare_parameter("map_path", "")
-    node.declare_parameter("map_origin_lat", 0.0)
-    node.declare_parameter("map_origin_lon", 0.0)
-    node.declare_parameter("map_origin_alt", 0.0)
     # OpenAI-compatible API
     node.declare_parameter("openai_api_key", "")
     node.declare_parameter("openai_base_url", "https://api.openai.com/v1")
@@ -927,10 +982,6 @@ def main():
     transport = node.get_parameter("transport").get_parameter_value().string_value
     host = node.get_parameter("host").get_parameter_value().string_value
     port = node.get_parameter("port").get_parameter_value().integer_value
-    map_path = node.get_parameter("map_path").get_parameter_value().string_value
-    origin_lat = node.get_parameter("map_origin_lat").get_parameter_value().double_value
-    origin_lon = node.get_parameter("map_origin_lon").get_parameter_value().double_value
-    origin_alt = node.get_parameter("map_origin_alt").get_parameter_value().double_value
     openai_api_key = node.get_parameter("openai_api_key").get_parameter_value().string_value
     openai_base_url = node.get_parameter("openai_base_url").get_parameter_value().string_value
     openai_model = node.get_parameter("openai_model").get_parameter_value().string_value
@@ -956,14 +1007,20 @@ def main():
         except Exception:
             node.get_logger().warn("Could not auto-detect NemoClaw token — chat proxy disabled")
 
-    # Auto-detect OpenAI API key from environment if not set via parameter
+    # Auto-detect API keys from environment if not set via parameter
+    import os
     if not openai_api_key:
-        import os
         openai_api_key = os.environ.get("OPENAI_API_KEY", "")
         if openai_api_key:
             node.get_logger().info("OpenAI API key loaded from OPENAI_API_KEY env var")
         else:
             node.get_logger().warn("No OpenAI API key — local agent chat disabled")
+
+    google_maps_api_key = os.environ.get("GOOGLE_MAPS_API_KEY", "")
+    if google_maps_api_key:
+        node.get_logger().info("Google Maps API key loaded from GOOGLE_MAPS_API_KEY env var")
+    else:
+        node.get_logger().warn("No Google Maps API key — geocode disabled")
 
     # Create MCP server
     mcp_server = AutowareMCPServer(
@@ -971,13 +1028,14 @@ def main():
         openai_api_key=openai_api_key,
         openai_base_url=openai_base_url,
         openai_model=openai_model,
+        google_maps_api_key=google_maps_api_key,
         # # Ollama (commented out)
         # ollama_url=ollama_url,
         # ollama_model=ollama_model,
         nemoclaw_port=nemoclaw_port,
         nemoclaw_token=nemoclaw_token,
     )
-    mcp_server.init_coordinate_resolver(map_path, origin_lat, origin_lon, origin_alt)
+    mcp_server.init_coordinate_resolver_from_topic()
 
     # Start ROS 2 executor in background thread
     executor = MultiThreadedExecutor()
