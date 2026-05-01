@@ -13,11 +13,7 @@
     max_steering_rad: 1.0
     max_velocity_mps: 25.0
 
-    # Lanelet2 map (for coordinate resolver)
-    map_path: ""
-    map_origin_lat: 0.0
-    map_origin_lon: 0.0
-    map_origin_alt: 0.0
+    # Lanelet2 map: loaded automatically from /map/vector_map topic
 
     # OpenAI-compatible API (for chat agent with function calling)
     # Leave openai_api_key empty to auto-detect from OPENAI_API_KEY env var
