@@ -19,7 +19,7 @@ install(DIRECTORY config/ DESTINATION share/${PROJECT_NAME}/config)
 install(DIRECTORY launch/ DESTINATION share/${PROJECT_NAME}/launch)
 install(FILES docker-compose.yml DESTINATION share/${PROJECT_NAME}/docker)
 
-# ── Docker container build (NemoClaw + Ollama) ──
+# ── Docker container build (NemoClaw) ──
 option(BUILD_DOCKER "Build/pull Docker containers for NemoClaw" ON)
 
 if(BUILD_DOCKER)
@@ -33,14 +33,27 @@ if(BUILD_DOCKER)
     )
     set(_docker_stamp ${CMAKE_CURRENT_BINARY_DIR}/docker_build.stamp)
 
+    # Build Docker image (NemoClaw only — Ollama removed, using OpenAI API)
     add_custom_command(
       OUTPUT ${_docker_stamp}
-      COMMAND ${DOCKER_CMD} compose -f ${CMAKE_CURRENT_SOURCE_DIR}/docker-compose.yml build
+      COMMAND ${DOCKER_CMD} compose -p autoware_claw -f ${CMAKE_CURRENT_SOURCE_DIR}/docker-compose.yml build
       COMMAND ${CMAKE_COMMAND} -E touch ${_docker_stamp}
       DEPENDS ${_docker_sources}
       WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
-      COMMENT "Running docker compose build for autoware_claw (NemoClaw + Ollama)..."
+      COMMENT "Running docker compose build for autoware_claw (NemoClaw)..."
     )
+
+    # # Ollama model pull removed — chat agent uses OpenAI API directly
+    # set(_model_stamp ${CMAKE_CURRENT_BINARY_DIR}/ollama_model.stamp)
+    # add_custom_command(
+    #   OUTPUT ${_model_stamp}
+    #   COMMAND ${DOCKER_CMD} compose -p autoware_claw -f ${CMAKE_CURRENT_SOURCE_DIR}/docker-compose.yml
+    #           --profile setup run --rm -T ollama-pull
+    #   COMMAND ${CMAKE_COMMAND} -E touch ${_model_stamp}
+    #   DEPENDS ${_docker_stamp}
+    #   WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    #   COMMENT "Pulling gemma4 model into ollama-data volume (skipped if already cached)..."
+    # )
 
     add_custom_target(${PROJECT_NAME}_docker ALL DEPENDS ${_docker_stamp})
   else()

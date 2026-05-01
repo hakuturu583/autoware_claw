@@ -79,7 +79,7 @@
   <!-- ── 3. NemoClaw + Ollama Docker containers ── -->
   <group if="$(var launch_nemoclaw_docker)">
     <executable
-      cmd="docker compose -f $(find-pkg-share autoware_claw)/docker/docker-compose.yml up --abort-on-container-exit"
+      cmd="docker compose -p autoware_claw -f $(find-pkg-share autoware_claw)/docker/docker-compose.yml up --no-build --abort-on-container-exit"
       name="nemoclaw_docker"
       output="screen"
       shell="true"

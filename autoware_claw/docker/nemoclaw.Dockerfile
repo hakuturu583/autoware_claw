@@ -105,35 +105,45 @@ WORKDIR /sandbox
 USER sandbox
 RUN python3 /usr/local/lib/nemoclaw/generate-openclaw-config.py
 
-# ── Autoware-specific: inject MCP server config into openclaw.json ──
-# Add Autoware MCP tool server so OpenClaw can access vehicle control tools.
-# This runs after generate-openclaw-config.py which creates the base config.
-COPY docker/autoware-overlay/inject-mcp-config.py /tmp/inject-mcp-config.py
-ARG AUTOWARE_MCP_URL=http://host.docker.internal:8765
-RUN AUTOWARE_MCP_URL="${AUTOWARE_MCP_URL}" python3 /tmp/inject-mcp-config.py
-
 # Install NemoClaw plugin into OpenClaw
 RUN openclaw doctor --fix > /dev/null 2>&1 || true \
     && openclaw plugins install /opt/nemoclaw > /dev/null 2>&1 || true
 
-# Inject gateway auth token (must be last mutable layer — cache busted by BUILD_ID)
+# ── Autoware-specific: inject MCP server config into openclaw.json ──
+# Must run AFTER openclaw doctor --fix, which strips unknown keys like mcpServers.
+COPY docker/autoware-overlay/inject-mcp-config.py /tmp/inject-mcp-config.py
+ARG AUTOWARE_MCP_URL=http://host.docker.internal:8765
+
+# Inject gateway auth token + Autoware MCP config (must be last mutable layer — cache busted by BUILD_ID)
 RUN NEMOCLAW_BUILD_ID="${NEMOCLAW_BUILD_ID}" python3 -c "\
 import json, os, secrets; \
 path = os.path.expanduser('~/.openclaw/openclaw.json'); \
 cfg = json.load(open(path)); \
 cfg.setdefault('gateway', {}).setdefault('auth', {})['token'] = secrets.token_hex(32); \
 json.dump(cfg, open(path, 'w'), indent=2); \
-os.chmod(path, 0o600)"
+os.chmod(path, 0o600)" \
+    && AUTOWARE_MCP_URL="${AUTOWARE_MCP_URL}" python3 /tmp/inject-mcp-config.py
 
-# Lock config (root ownership)
+# Lock config (root-owned read-only) but allow gateway user to write runtime state
 USER root
 RUN chown root:root /sandbox/.openclaw \
-    && find /sandbox/.openclaw -mindepth 1 -maxdepth 1 -exec chown -h root:root {} + \
     && chmod 755 /sandbox/.openclaw \
-    && chmod 444 /sandbox/.openclaw/openclaw.json \
+    && chown root:gateway /sandbox/.openclaw/openclaw.json \
+    && chmod 664 /sandbox/.openclaw/openclaw.json \
     && sha256sum /sandbox/.openclaw/openclaw.json > /sandbox/.openclaw/.config-hash \
     && chmod 444 /sandbox/.openclaw/.config-hash \
-    && chown root:root /sandbox/.openclaw/.config-hash
+    && chown root:root /sandbox/.openclaw/.config-hash \
+    # Gateway (uid 999) needs write access for plugin runtime deps, agents, logs, canvas, backups
+    && mkdir -p /sandbox/.openclaw/plugin-runtime-deps \
+                /sandbox/.openclaw/agents \
+                /sandbox/.openclaw/logs \
+                /sandbox/.openclaw/canvas \
+    && touch /sandbox/.openclaw/openclaw.json.last-good \
+    && chown -R gateway:gateway /sandbox/.openclaw/plugin-runtime-deps \
+                                /sandbox/.openclaw/agents \
+                                /sandbox/.openclaw/logs \
+                                /sandbox/.openclaw/canvas \
+    && chown gateway:gateway /sandbox/.openclaw/openclaw.json.last-good
 
 # Lock .nemoclaw directory (blueprint immutability)
 RUN chown root:root /sandbox/.nemoclaw \

@@ -25,6 +25,7 @@ from autoware_vehicle_msgs.msg import (
 from autoware_perception_msgs.msg import PredictedObjects, TrafficLightGroupArray
 from autoware_planning_msgs.msg import LaneletRoute
 from autoware_adapi_v1_msgs.msg import OperationModeState
+from autoware_map_msgs.msg import LaneletMapBin
 from nav_msgs.msg import Odometry
 from tier4_control_msgs.msg import GateMode
 from tier4_external_api_msgs.msg import Heartbeat
@@ -71,6 +72,8 @@ class AutowareROSNode(Node):
         self._traffic_signals: list[TrafficSignal] = []
         self._route_state: str = "UNSET"
         self._heartbeat_active = False
+        self._vector_map_bin: bytes | None = None
+        self._on_vector_map_callback = None
 
         self._setup_subscribers()
         self._setup_publishers()
@@ -115,6 +118,16 @@ class AutowareROSNode(Node):
         )
         self.create_subscription(
             Engage, "/api/autoware/get/engage", self._on_engage, RELIABLE_QOS
+        )
+        self.create_subscription(
+            LaneletMapBin,
+            "/map/vector_map",
+            self._on_vector_map,
+            QoSProfile(
+                reliability=ReliabilityPolicy.RELIABLE,
+                durability=DurabilityPolicy.TRANSIENT_LOCAL,
+                depth=1,
+            ),
         )
 
     # ──────────────────────────────────────────────
@@ -278,6 +291,22 @@ class AutowareROSNode(Node):
     def _on_engage(self, msg: Engage) -> None:
         with self._lock:
             self._state.is_engaged = msg.engage
+
+    def _on_vector_map(self, msg: LaneletMapBin) -> None:
+        self.get_logger().info(
+            f"Received vector map ({len(msg.data)} bytes)"
+        )
+        with self._lock:
+            self._vector_map_bin = bytes(msg.data)
+        if self._on_vector_map_callback:
+            self._on_vector_map_callback(self._vector_map_bin)
+
+    def get_vector_map_bin(self) -> bytes | None:
+        with self._lock:
+            return self._vector_map_bin
+
+    def set_on_vector_map_callback(self, callback) -> None:
+        self._on_vector_map_callback = callback
 
     # ──────────────────────────────────────────────
     # State getters (thread-safe)
