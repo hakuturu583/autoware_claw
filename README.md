@@ -168,6 +168,8 @@ Response flows back: Autoware → MCP → NemoClaw → RViz Chat
 - **Python packages:** `rosclaw`, `mcp`, `uvicorn`, `starlette` (installed via pip)
 - **Brave API key** (optional, for NemoClaw web search): set `BRAVE_API_KEY` environment variable
 
+> For a detailed step-by-step guide on integrating autoware_claw into an Autoware workspace, see [Building with Autoware](docs/building-with-autoware.md).
+
 ## Build
 
 ```bash
