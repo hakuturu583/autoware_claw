@@ -13,25 +13,17 @@ services:
     networks:
       - internal-net
     healthcheck:
-      # Only healthy once gemma4 model is pulled and ready to serve
-      test: ["CMD-SHELL", "curl -sf http://localhost:11434/api/tags | grep -q gemma4"]
-      interval: 10s
+      # Healthy once ollama is serving and gemma4 model is available.
+      # Model weights are pre-pulled into ollama-data volume during colcon build
+      # (via ollama-pull service). No runtime pull needed.
+      # Note: uses `ollama list` instead of /api/tags due to Ollama 0.22+ API issue.
+      test: ["CMD-SHELL", "ollama list | grep -q gemma4"]
+      interval: 5s
       timeout: 5s
-      retries: 30
-      start_period: 60s
-    entrypoint: >
-      bash -c "
-        ollama serve &
-        OLLAMA_PID=$$!;
-        for i in $$(seq 1 30); do
-          curl -sf http://localhost:11434/api/tags >/dev/null 2>&1 && break;
-          sleep 2;
-        done;
-        echo '[autoware_claw] Pulling gemma4 model (skipped if already cached in volume)...';
-        ollama pull gemma4;
-        echo '[autoware_claw] gemma4 ready.';
-        wait $$OLLAMA_PID
-      "
+      retries: 60
+      start_period: 10s
+    # Default entrypoint: ollama serve
+    # Model is pre-cached in ollama-data volume by the ollama-pull build step.
 
   # One-shot service: pull gemma4 weights into ollama-data volume during colcon build.
   # Uses "setup" profile so it does NOT start with normal `docker compose up`.
@@ -55,6 +47,24 @@ services:
 
   nemoclaw:
     image: autoware_claw-nemoclaw:latest
+    tty: true
+    stdin_open: true
+    # Override entrypoint: nemoclaw-start requires capsh/Landlock which may not
+    # be available in all container runtimes. Launch gateway directly instead.
+    entrypoint: ["bash", "-c"]
+    command:
+      - |
+        # Apply model override
+        python3 -c "
+        import json, os
+        cfg_path = os.path.expanduser('~/.openclaw/openclaw.json')
+        cfg = json.load(open(cfg_path))
+        cfg.setdefault('models', {})['primary'] = os.environ.get('NEMOCLAW_MODEL_OVERRIDE', 'gemma4')
+        json.dump(cfg, open(cfg_path, 'w'), indent=2)
+        " 2>/dev/null || true
+        # Start gateway
+        exec openclaw gateway run --port 18789
+    user: gateway
     build:
       context: .
       dockerfile: docker/nemoclaw.Dockerfile

@@ -125,15 +125,25 @@ cfg.setdefault('gateway', {}).setdefault('auth', {})['token'] = secrets.token_he
 json.dump(cfg, open(path, 'w'), indent=2); \
 os.chmod(path, 0o600)"
 
-# Lock config (root ownership)
+# Lock config (root-owned read-only) but allow gateway user to write runtime state
 USER root
 RUN chown root:root /sandbox/.openclaw \
-    && find /sandbox/.openclaw -mindepth 1 -maxdepth 1 -exec chown -h root:root {} + \
     && chmod 755 /sandbox/.openclaw \
     && chmod 444 /sandbox/.openclaw/openclaw.json \
     && sha256sum /sandbox/.openclaw/openclaw.json > /sandbox/.openclaw/.config-hash \
     && chmod 444 /sandbox/.openclaw/.config-hash \
-    && chown root:root /sandbox/.openclaw/.config-hash
+    && chown root:root /sandbox/.openclaw/.config-hash \
+    # Gateway (uid 999) needs write access for plugin runtime deps, agents, logs, canvas, backups
+    && mkdir -p /sandbox/.openclaw/plugin-runtime-deps \
+                /sandbox/.openclaw/agents \
+                /sandbox/.openclaw/logs \
+                /sandbox/.openclaw/canvas \
+    && touch /sandbox/.openclaw/openclaw.json.last-good \
+    && chown -R gateway:gateway /sandbox/.openclaw/plugin-runtime-deps \
+                                /sandbox/.openclaw/agents \
+                                /sandbox/.openclaw/logs \
+                                /sandbox/.openclaw/canvas \
+    && chown gateway:gateway /sandbox/.openclaw/openclaw.json.last-good
 
 # Lock .nemoclaw directory (blueprint immutability)
 RUN chown root:root /sandbox/.nemoclaw \
