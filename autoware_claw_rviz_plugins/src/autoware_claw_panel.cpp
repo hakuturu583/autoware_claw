@@ -21,6 +21,7 @@
 #include <QJsonObject>
 #include <QNetworkRequest>
 #include <QScrollBar>
+#include <QStringList>
 #include <QTimer>
 #include <QVBoxLayout>
 
@@ -164,6 +165,19 @@ void AutowareClawPanel::onNetworkReply(QNetworkReply * reply)
 
   if (doc.isObject()) {
     const auto obj = doc.object();
+
+    // Display tool calls if present
+    if (obj.contains("tool_calls")) {
+      const auto tools = obj["tool_calls"].toArray();
+      if (!tools.isEmpty()) {
+        QStringList tool_names;
+        for (const auto & t : tools) {
+          tool_names.append(t.toString());
+        }
+        appendMessage("Tool", tool_names.join(", "));
+      }
+    }
+
     // Try common response fields
     QString response;
     if (obj.contains("response")) {
@@ -204,6 +218,8 @@ void AutowareClawPanel::appendMessage(const QString & sender, const QString & te
     color = "#569cd6";
   } else if (sender == "OpenClaw") {
     color = "#4ec9b0";
+  } else if (sender == "Tool") {
+    color = "#dcdcaa";
   } else if (sender == "System") {
     color = "#ce9178";
   }
@@ -240,6 +256,7 @@ void AutowareClawPanel::sendChatRequest(const QString & message)
 
   QNetworkRequest request(QUrl(gateway_url_ + "/chat"));
   request.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
+  request.setTransferTimeout(120000);  // 120s — OpenAI tool-calling loop may take time
 
   network_manager_->post(request, QJsonDocument(body).toJson(QJsonDocument::Compact));
 }

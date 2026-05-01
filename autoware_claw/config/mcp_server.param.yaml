@@ -18,3 +18,13 @@
     map_origin_lat: 0.0
     map_origin_lon: 0.0
     map_origin_alt: 0.0
+
+    # OpenAI-compatible API (for chat agent with function calling)
+    # Leave openai_api_key empty to auto-detect from OPENAI_API_KEY env var
+    openai_api_key: ""
+    openai_base_url: "https://api.openai.com/v1"
+    openai_model: "gpt-4.1"
+
+    # # Ollama (commented out — gemma4 does not support function calling)
+    # ollama_url: "http://127.0.0.1:11435"
+    # ollama_model: "gemma4"
