@@ -59,12 +59,14 @@ class AutowareMCPServer:
     # Tool registration
     # ──────────────────────────────────────────────
 
+    def _get_tools_list(self) -> list[Tool]:
+        """Return the list of available MCP tools (used by both MCP and chat endpoints)."""
+        return self._tools
+
     def _register_tools(self) -> None:
         server = self._server
 
-        @server.list_tools()
-        async def list_tools() -> list[Tool]:
-            return [
+        self._tools = [
                 # Display tools
                 Tool(
                     name="autoware_get_vehicle_state",
@@ -250,6 +252,10 @@ class AutowareMCPServer:
                     inputSchema={"type": "object", "properties": {}},
                 ),
             ]
+
+        @server.list_tools()
+        async def list_tools() -> list[Tool]:
+            return self._tools
 
         @server.call_tool()
         async def call_tool(name: str, arguments: dict) -> list[TextContent]:
@@ -489,8 +495,22 @@ class AutowareMCPServer:
             state = self._node.get_vehicle_state()
             return JSONResponse({"status": "ok", "connected": state.is_connected})
 
+        def _build_ollama_tools() -> list[dict]:
+            """Convert MCP tool definitions to Ollama tool calling format."""
+            tools = []
+            for tool in self._get_tools_list():
+                tools.append({
+                    "type": "function",
+                    "function": {
+                        "name": tool.name,
+                        "description": tool.description,
+                        "parameters": tool.inputSchema,
+                    },
+                })
+            return tools
+
         async def handle_chat(request: Request):
-            """Chat proxy: forwards user message to Ollama with vehicle state context."""
+            """Chat with tool calling: LLM can invoke Autoware MCP tools."""
             try:
                 body = await request.json()
             except Exception:
@@ -503,29 +523,70 @@ class AutowareMCPServer:
             vehicle_context = self._build_vehicle_context()
             system_prompt = (
                 "You are an autonomous driving assistant for the Autoware platform. "
-                "You help operators understand vehicle state, diagnose issues, and "
-                "provide guidance on autonomous driving operations.\n\n"
+                "You can monitor vehicle state and control the vehicle using tools.\n\n"
+                "When the user asks to navigate somewhere, use autoware_resolve_goal "
+                "to convert coordinates, then autoware_set_goal to set the destination, "
+                "then autoware_engage to start driving.\n\n"
                 f"{vehicle_context}\n"
-                "Answer concisely and accurately based on the vehicle data above."
+                "Answer concisely in the user's language."
             )
 
             ollama_url = self._ollama_url + "/api/chat"
-            payload = {
-                "model": self._ollama_model,
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_message},
-                ],
-                "stream": False,
-            }
+            ollama_tools = _build_ollama_tools()
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_message},
+            ]
 
+            max_rounds = 5
             try:
                 async with httpx.AsyncClient(timeout=120.0) as client:
-                    resp = await client.post(ollama_url, json=payload)
-                    resp.raise_for_status()
-                    data = resp.json()
-                    content = data.get("message", {}).get("content", "")
-                    return JSONResponse({"response": content})
+                    for _ in range(max_rounds):
+                        payload = {
+                            "model": self._ollama_model,
+                            "messages": messages,
+                            "tools": ollama_tools,
+                            "stream": False,
+                        }
+                        resp = await client.post(ollama_url, json=payload)
+                        resp.raise_for_status()
+                        data = resp.json()
+                        assistant_msg = data.get("message", {})
+
+                        tool_calls = assistant_msg.get("tool_calls")
+                        if not tool_calls:
+                            # No tool calls — return final text response
+                            content = assistant_msg.get("content", "")
+                            return JSONResponse({"response": content})
+
+                        # Append assistant message with tool calls
+                        messages.append(assistant_msg)
+
+                        # Execute each tool call and append results
+                        for tc in tool_calls:
+                            fn = tc.get("function", {})
+                            tool_name = fn.get("name", "")
+                            tool_args = fn.get("arguments", {})
+
+                            handler = self._tool_handlers.get(tool_name)
+                            if handler:
+                                try:
+                                    result = handler(tool_args)
+                                except Exception as e:
+                                    result = {"error": str(e)}
+                            else:
+                                result = {"error": f"Unknown tool: {tool_name}"}
+
+                            messages.append({
+                                "role": "tool",
+                                "content": json.dumps(result, ensure_ascii=False, default=str),
+                            })
+
+                    # Exhausted rounds — return last content
+                    return JSONResponse({
+                        "response": assistant_msg.get("content", "(tool calling limit reached)")
+                    })
+
             except httpx.ConnectError:
                 return JSONResponse(
                     {"error": "Cannot connect to Ollama — is the container running?"},
