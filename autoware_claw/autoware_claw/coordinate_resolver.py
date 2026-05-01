@@ -53,6 +53,30 @@ class CoordinateResolver:
         all_lanelets = laneletLayer(self._lanelet_map)
         self._road_lanelets = roadLanelets(all_lanelets)
 
+    @classmethod
+    def from_bin_data(cls, data: bytes) -> "CoordinateResolver":
+        """Create a CoordinateResolver from LaneletMapBin binary data.
+
+        Writes the binary to a temp file and loads it via lanelet2's BinHandler.
+        The MGRSProjector origin is embedded in the binary data.
+        """
+        import tempfile
+        import os
+
+        instance = cls.__new__(cls)
+        with tempfile.NamedTemporaryFile(suffix=".bin", delete=False) as f:
+            f.write(data)
+            tmp_path = f.name
+        try:
+            instance._origin = Origin(0.0, 0.0, 0.0)
+            instance._projector = MGRSProjector(instance._origin)
+            instance._lanelet_map = lanelet2.io.load(tmp_path, instance._projector)
+        finally:
+            os.unlink(tmp_path)
+        all_lanelets = laneletLayer(instance._lanelet_map)
+        instance._road_lanelets = roadLanelets(all_lanelets)
+        return instance
+
     def resolve_goal(
         self,
         lat: float,
