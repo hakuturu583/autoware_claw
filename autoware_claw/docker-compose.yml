@@ -57,13 +57,15 @@ services:
     entrypoint: ["bash", "-c"]
     command:
       - |
-        # Apply model override
+        # Inject Brave API key at runtime (config file is gateway-writable)
         python3 -c "
         import json, os
-        cfg_path = os.path.expanduser('~/.openclaw/openclaw.json')
-        cfg = json.load(open(cfg_path))
-        cfg.setdefault('models', {})['primary'] = os.environ.get('NEMOCLAW_MODEL_OVERRIDE', 'gemma4')
-        json.dump(cfg, open(cfg_path, 'w'), indent=2)
+        cfg_path = '/sandbox/.openclaw/openclaw.json'
+        brave_key = os.environ.get('BRAVE_API_KEY', '')
+        if brave_key:
+            cfg = json.load(open(cfg_path))
+            cfg.setdefault('plugins', {}).setdefault('entries', {}).setdefault('brave', {}).setdefault('config', {}).setdefault('webSearch', {})['apiKey'] = brave_key
+            json.dump(cfg, open(cfg_path, 'w'), indent=2)
         " 2>/dev/null || true
         # Start gateway
         exec openclaw gateway run --port 18789
@@ -85,8 +87,6 @@ services:
       ollama:
         condition: service_healthy
     environment:
-      - NEMOCLAW_MODEL_OVERRIDE=gemma4
-      - NEMOCLAW_INFERENCE_API_OVERRIDE=openai-completions
       - BRAVE_API_KEY=${BRAVE_API_KEY:-}
     extra_hosts:
       - "host.docker.internal:host-gateway"

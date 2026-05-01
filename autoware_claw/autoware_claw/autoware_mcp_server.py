@@ -32,12 +32,17 @@ class AutowareMCPServer:
         ros_node: AutowareROSNode,
         ollama_url: str = "http://127.0.0.1:11435",
         ollama_model: str = "gemma4",
+        nemoclaw_port: int = 18789,
+        nemoclaw_token: str = "",
     ) -> None:
         self._node = ros_node
         self._server = Server("rosclaw-autoware-mcp")
         self._coord_resolver: CoordinateResolver | None = None
         self._ollama_url = ollama_url
         self._ollama_model = ollama_model
+        self._nemoclaw_port = nemoclaw_port
+        self._nemoclaw_ws_url = f"ws://127.0.0.1:{nemoclaw_port}"
+        self._nemoclaw_token = nemoclaw_token
         self._register_tools()
 
     def init_coordinate_resolver(
@@ -471,7 +476,7 @@ class AutowareMCPServer:
             f"  MRM: {state.mrm_state}/{state.mrm_behavior}\n"
         )
 
-    async def run_sse(self, host: str = "127.0.0.1", port: int = 8765) -> None:
+    async def run_sse(self, host: str = "0.0.0.0", port: int = 8765) -> None:
         """Run MCP server with SSE transport."""
         from mcp.server.sse import SseServerTransport
         from starlette.applications import Starlette
@@ -495,22 +500,109 @@ class AutowareMCPServer:
             state = self._node.get_vehicle_state()
             return JSONResponse({"status": "ok", "connected": state.is_connected})
 
-        def _build_ollama_tools() -> list[dict]:
-            """Convert MCP tool definitions to Ollama tool calling format."""
-            tools = []
-            for tool in self._get_tools_list():
-                tools.append({
-                    "type": "function",
-                    "function": {
-                        "name": tool.name,
-                        "description": tool.description,
-                        "parameters": tool.inputSchema,
+        async def _nemoclaw_chat(message: str, timeout_s: float = 120.0) -> str:
+            """Send a chat message to NemoClaw via WebSocket and return the response."""
+            import websockets
+
+            gateway_url = self._nemoclaw_ws_url
+            gateway_token = self._nemoclaw_token
+
+            headers = {"Origin": f"http://127.0.0.1:{self._nemoclaw_port}"}
+            async with websockets.connect(gateway_url, additional_headers=headers) as ws:
+                # 1. Wait for challenge
+                await asyncio.wait_for(ws.recv(), timeout=5.0)
+
+                # 2. Connect with auth
+                import uuid as _uuid
+                connect_id = str(_uuid.uuid4())
+                await ws.send(json.dumps({
+                    "type": "req", "id": connect_id,
+                    "method": "connect",
+                    "params": {
+                        "minProtocol": 3, "maxProtocol": 3,
+                        "client": {
+                            "id": "openclaw-control-ui",
+                            "version": "1.0.0",
+                            "platform": "linux",
+                            "mode": "webchat",
+                        },
+                        "role": "operator",
+                        "scopes": ["operator.read", "operator.write"],
+                        "auth": {"token": gateway_token},
+                        "caps": ["tool-events"],
                     },
-                })
-            return tools
+                }))
+
+                # Wait for connect OK
+                connected = False
+                for _ in range(5):
+                    msg = await asyncio.wait_for(ws.recv(), timeout=5.0)
+                    data = json.loads(msg)
+                    if data.get("type") == "res":
+                        if data.get("ok"):
+                            connected = True
+                            break
+                        else:
+                            err = data.get("error", {}).get("message", "unknown error")
+                            raise ConnectionError(f"NemoClaw connect failed: {err}")
+
+                if not connected:
+                    raise ConnectionError("NemoClaw connect: no response")
+
+                # 3. Send chat message
+                session_key = str(_uuid.uuid4())
+                chat_id = str(_uuid.uuid4())
+                await ws.send(json.dumps({
+                    "type": "req", "id": chat_id,
+                    "method": "chat.send",
+                    "params": {
+                        "sessionKey": session_key,
+                        "message": message,
+                        "deliver": True,
+                        "idempotencyKey": str(_uuid.uuid4()),
+                    },
+                }))
+
+                # 4. Collect streamed response until lifecycle/end or chat/final
+                full_text = ""
+                deadline = asyncio.get_event_loop().time() + timeout_s
+                while asyncio.get_event_loop().time() < deadline:
+                    remaining = deadline - asyncio.get_event_loop().time()
+                    try:
+                        msg = await asyncio.wait_for(ws.recv(), timeout=min(remaining, 30.0))
+                    except asyncio.TimeoutError:
+                        break
+                    data = json.loads(msg)
+                    if data.get("type") != "event":
+                        continue
+                    payload = data.get("payload", {})
+                    event = data.get("event", "")
+
+                    if event == "agent":
+                        stream = payload.get("stream", "")
+                        pdata = payload.get("data", {})
+                        if stream == "assistant":
+                            delta = pdata.get("delta", "")
+                            if delta:
+                                full_text += delta
+                        elif stream == "lifecycle" and pdata.get("phase") == "end":
+                            break
+                    elif event == "chat":
+                        state = payload.get("state", "")
+                        if state == "final":
+                            # Extract final text from structured content
+                            msg_obj = payload.get("message", {})
+                            content = msg_obj.get("content", [])
+                            if content and isinstance(content, list):
+                                for part in content:
+                                    if isinstance(part, dict) and part.get("type") == "text":
+                                        full_text = part.get("text", full_text)
+                            break
+
+                return full_text
 
         async def handle_chat(request: Request):
-            """Chat with tool calling: LLM can invoke Autoware MCP tools."""
+            """Chat proxy: forwards messages to NemoClaw agent via WebSocket."""
             try:
                 body = await request.json()
             except Exception:
@@ -520,80 +612,14 @@ class AutowareMCPServer:
             if not user_message:
                 return JSONResponse({"error": "message is required"}, status_code=400)
 
-            vehicle_context = self._build_vehicle_context()
-            system_prompt = (
-                "You are an autonomous driving assistant for the Autoware platform. "
-                "You can monitor vehicle state and control the vehicle using tools.\n\n"
-                "When the user asks to navigate somewhere, use autoware_resolve_goal "
-                "to convert coordinates, then autoware_set_goal to set the destination, "
-                "then autoware_engage to start driving.\n\n"
-                f"{vehicle_context}\n"
-                "Answer concisely in the user's language."
-            )
-
-            ollama_url = self._ollama_url + "/api/chat"
-            ollama_tools = _build_ollama_tools()
-            messages = [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_message},
-            ]
-
-            max_rounds = 5
             try:
-                async with httpx.AsyncClient(timeout=120.0) as client:
-                    for _ in range(max_rounds):
-                        payload = {
-                            "model": self._ollama_model,
-                            "messages": messages,
-                            "tools": ollama_tools,
-                            "stream": False,
-                        }
-                        resp = await client.post(ollama_url, json=payload)
-                        resp.raise_for_status()
-                        data = resp.json()
-                        assistant_msg = data.get("message", {})
-
-                        tool_calls = assistant_msg.get("tool_calls")
-                        if not tool_calls:
-                            # No tool calls — return final text response
-                            content = assistant_msg.get("content", "")
-                            return JSONResponse({"response": content})
-
-                        # Append assistant message with tool calls
-                        messages.append(assistant_msg)
-
-                        # Execute each tool call and append results
-                        for tc in tool_calls:
-                            fn = tc.get("function", {})
-                            tool_name = fn.get("name", "")
-                            tool_args = fn.get("arguments", {})
-
-                            handler = self._tool_handlers.get(tool_name)
-                            if handler:
-                                try:
-                                    result = handler(tool_args)
-                                except Exception as e:
-                                    result = {"error": str(e)}
-                            else:
-                                result = {"error": f"Unknown tool: {tool_name}"}
-
-                            messages.append({
-                                "role": "tool",
-                                "content": json.dumps(result, ensure_ascii=False, default=str),
-                            })
-
-                    # Exhausted rounds — return last content
-                    return JSONResponse({
-                        "response": assistant_msg.get("content", "(tool calling limit reached)")
-                    })
-
-            except httpx.ConnectError:
-                return JSONResponse(
-                    {"error": "Cannot connect to Ollama — is the container running?"},
-                    status_code=502,
-                )
-            except Exception as e:
+                response_text = await _nemoclaw_chat(user_message)
+                return JSONResponse({"response": response_text})
+            except ConnectionError as e:
                 return JSONResponse({"error": str(e)}, status_code=502)
+            except Exception as e:
+                self._node.get_logger().error(f"Chat proxy error: {e}")
+                return JSONResponse({"error": f"NemoClaw error: {e}"}, status_code=502)
 
         routes = [
             Route("/health", handle_health),
@@ -628,7 +654,7 @@ def main():
 
     # Read parameters
     node.declare_parameter("transport", "sse")
-    node.declare_parameter("host", "127.0.0.1")
+    node.declare_parameter("host", "0.0.0.0")
     node.declare_parameter("port", 8765)
     node.declare_parameter("map_path", "")
     node.declare_parameter("map_origin_lat", 0.0)
@@ -636,6 +662,8 @@ def main():
     node.declare_parameter("map_origin_alt", 0.0)
     node.declare_parameter("ollama_url", "http://127.0.0.1:11435")
     node.declare_parameter("ollama_model", "gemma4")
+    node.declare_parameter("nemoclaw_port", 18789)
+    node.declare_parameter("nemoclaw_token", "")
 
     transport = node.get_parameter("transport").get_parameter_value().string_value
     host = node.get_parameter("host").get_parameter_value().string_value
@@ -646,9 +674,33 @@ def main():
     origin_alt = node.get_parameter("map_origin_alt").get_parameter_value().double_value
     ollama_url = node.get_parameter("ollama_url").get_parameter_value().string_value
     ollama_model = node.get_parameter("ollama_model").get_parameter_value().string_value
+    nemoclaw_port = node.get_parameter("nemoclaw_port").get_parameter_value().integer_value
+    nemoclaw_token = node.get_parameter("nemoclaw_token").get_parameter_value().string_value
+
+    # Auto-detect NemoClaw token if not provided
+    if not nemoclaw_token:
+        import subprocess
+        try:
+            result = subprocess.run(
+                ["docker", "exec", "autoware_claw-nemoclaw-1", "python3", "-c",
+                 "import json; print(json.load(open('/sandbox/.openclaw/openclaw.json'))"
+                 ".get('gateway',{}).get('auth',{}).get('token',''))"],
+                capture_output=True, text=True, timeout=5,
+            )
+            nemoclaw_token = result.stdout.strip()
+            if nemoclaw_token:
+                node.get_logger().info("NemoClaw gateway token auto-detected")
+        except Exception:
+            node.get_logger().warn("Could not auto-detect NemoClaw token — chat proxy disabled")
 
     # Create MCP server
-    mcp_server = AutowareMCPServer(node, ollama_url=ollama_url, ollama_model=ollama_model)
+    mcp_server = AutowareMCPServer(
+        node,
+        ollama_url=ollama_url,
+        ollama_model=ollama_model,
+        nemoclaw_port=nemoclaw_port,
+        nemoclaw_token=nemoclaw_token,
+    )
     mcp_server.init_coordinate_resolver(map_path, origin_lat, origin_lon, origin_alt)
 
     # Start ROS 2 executor in background thread
