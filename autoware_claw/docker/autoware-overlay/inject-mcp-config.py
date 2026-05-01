@@ -23,13 +23,10 @@ def main() -> None:
         config = json.load(f)
 
     # Add MCP server configuration for Autoware
-    # OpenClaw's mcpServers key maps server names to their transport config.
-    config.setdefault("mcpServers", {})
-    config["mcpServers"]["autoware"] = {
+    # OpenClaw uses mcp.servers to map server names to their transport config.
+    config.setdefault("mcp", {}).setdefault("servers", {})
+    config["mcp"]["servers"]["autoware"] = {
         "url": f"{mcp_url}/sse",
-        "transport": {
-            "type": "sse",
-        },
     }
 
     with open(config_path, "w") as f:

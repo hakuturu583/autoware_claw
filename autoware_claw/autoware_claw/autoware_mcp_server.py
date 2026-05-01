@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """Autoware MCP Server — bridges LLM agents to Autoware via MCP protocol.
 
 Follows the ur5_server.py pattern from ROSClaw: a Server instance registers
@@ -26,10 +27,31 @@ from autoware_claw.types import GEAR_MAP
 class AutowareMCPServer:
     """MCP server exposing Autoware HMI tools to LLM agents."""
 
-    def __init__(self, ros_node: AutowareROSNode) -> None:
+    def __init__(
+        self,
+        ros_node: AutowareROSNode,
+        # OpenAI-compatible API
+        openai_api_key: str = "",
+        openai_base_url: str = "https://api.openai.com/v1",
+        openai_model: str = "gpt-4.1",
+        # # Ollama (commented out — gemma4 does not support function calling)
+        # ollama_url: str = "http://127.0.0.1:11435",
+        # ollama_model: str = "gemma4",
+        nemoclaw_port: int = 18789,
+        nemoclaw_token: str = "",
+    ) -> None:
         self._node = ros_node
         self._server = Server("rosclaw-autoware-mcp")
         self._coord_resolver: CoordinateResolver | None = None
+        self._openai_api_key = openai_api_key
+        self._openai_base_url = openai_base_url.rstrip("/")
+        self._openai_model = openai_model
+        # # Ollama (commented out)
+        # self._ollama_url = ollama_url
+        # self._ollama_model = ollama_model
+        self._nemoclaw_port = nemoclaw_port
+        self._nemoclaw_ws_url = f"ws://127.0.0.1:{nemoclaw_port}"
+        self._nemoclaw_token = nemoclaw_token
         self._register_tools()
 
     def init_coordinate_resolver(
@@ -51,12 +73,14 @@ class AutowareMCPServer:
     # Tool registration
     # ──────────────────────────────────────────────
 
+    def _get_tools_list(self) -> list[Tool]:
+        """Return the list of available MCP tools (used by both MCP and chat endpoints)."""
+        return self._tools
+
     def _register_tools(self) -> None:
         server = self._server
 
-        @server.list_tools()
-        async def list_tools() -> list[Tool]:
-            return [
+        self._tools = [
                 # Display tools
                 Tool(
                     name="autoware_get_vehicle_state",
@@ -242,6 +266,10 @@ class AutowareMCPServer:
                     inputSchema={"type": "object", "properties": {}},
                 ),
             ]
+
+        @server.list_tools()
+        async def list_tools() -> list[Tool]:
+            return self._tools
 
         @server.call_tool()
         async def call_tool(name: str, arguments: dict) -> list[TextContent]:
@@ -439,13 +467,217 @@ class AutowareMCPServer:
     # Server lifecycle
     # ──────────────────────────────────────────────
 
-    async def run_sse(self, host: str = "127.0.0.1", port: int = 8765) -> None:
+    def _build_vehicle_context(self) -> str:
+        """Build a system prompt section with current vehicle state."""
+        state = self._node.get_vehicle_state()
+        if not state.is_connected:
+            return "Vehicle status: NOT CONNECTED (no data available)"
+        return (
+            f"Vehicle status (live):\n"
+            f"  Position: x={state.x:.1f}, y={state.y:.1f}, z={state.z:.1f}\n"
+            f"  Orientation: yaw={state.yaw:.3f} rad\n"
+            f"  Speed: {state.velocity_mps:.2f} m/s ({state.velocity_mps * 3.6:.1f} km/h)\n"
+            f"  Steering: {state.steering_tire_angle_rad:.3f} rad\n"
+            f"  Gear: {GEAR_MAP.get(state.gear, 'UNKNOWN')}\n"
+            f"  Operation mode: {state.operation_mode}\n"
+            f"  Autoware control: {'enabled' if state.is_autoware_control_enabled else 'disabled'}\n"
+            f"  Engaged: {'yes' if state.is_engaged else 'no'}\n"
+            f"  MRM: {state.mrm_state}/{state.mrm_behavior}\n"
+        )
+
+    # ──────────────────────────────────────────────
+    # Local Ollama agent (tool-calling)
+    # ──────────────────────────────────────────────
+
+    async def _geocode(self, query: str) -> dict:
+        """Geocode a place name to lat/lon using Nominatim (OpenStreetMap)."""
+        import httpx
+
+        logger = self._node.get_logger()
+        logger.info(f"[geocode] Resolving: {query}")
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(
+                    "https://nominatim.openstreetmap.org/search",
+                    params={"q": query, "format": "json", "limit": 3, "accept-language": "ja"},
+                    headers={"User-Agent": "autoware-claw/1.0"},
+                )
+                results = resp.json()
+                if results:
+                    top = results[0]
+                    logger.info(
+                        f"[geocode] Found: {top.get('display_name', '')} "
+                        f"({top['lat']}, {top['lon']})"
+                    )
+                    return {
+                        "lat": float(top["lat"]),
+                        "lon": float(top["lon"]),
+                        "display_name": top.get("display_name", ""),
+                    }
+                return {"error": f"Could not find location: {query}"}
+        except Exception as e:
+            logger.error(f"[geocode] Error: {e}")
+            return {"error": f"Geocoding failed: {e}"}
+
+    def _build_openai_tools(self) -> list[dict]:
+        """Build OpenAI function-calling tool definitions."""
+        tools = []
+        for tool in self._tools:
+            tools.append({
+                "type": "function",
+                "function": {
+                    "name": tool.name,
+                    "description": tool.description,
+                    "parameters": tool.inputSchema,
+                },
+            })
+        tools.append({
+            "type": "function",
+            "function": {
+                "name": "geocode",
+                "description": (
+                    "Convert a place name or address to latitude and longitude. "
+                    "Use this when the user mentions a destination by name."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "Place name or address to geocode.",
+                        },
+                    },
+                    "required": ["query"],
+                },
+            },
+        })
+        return tools
+
+    async def _local_agent_chat(self, message: str) -> dict:
+        """Handle chat via OpenAI-compatible API with native function calling."""
+        import httpx
+
+        logger = self._node.get_logger()
+
+        if not self._openai_api_key:
+            raise RuntimeError("OpenAI API key is not configured")
+
+        openai_tools = self._build_openai_tools()
+
+        system_prompt = (
+            "You are Autoware CLAW, an autonomous driving assistant controlling a real vehicle.\n"
+            "IMPORTANT: You MUST use tools to perform every action. "
+            "Never claim to have done something without calling the corresponding tool.\n\n"
+            "When the user asks to navigate somewhere:\n"
+            "1. Use geocode to get lat/lon from the place name\n"
+            "2. Use autoware_resolve_goal to get lane-aligned goal candidates\n"
+            "3. Use autoware_set_goal with the first candidate\n"
+            "4. Use autoware_engage with engage=true to start autonomous driving\n"
+            "5. Report the result to the user\n\n"
+            f"{self._build_vehicle_context()}\n"
+            "Respond in the same language as the user."
+        )
+
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": message},
+        ]
+        tool_calls_log = []
+
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self._openai_api_key}",
+        }
+
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            for iteration in range(10):
+                logger.info(f"[agent] Iteration {iteration + 1}")
+                try:
+                    resp = await client.post(
+                        f"{self._openai_base_url}/chat/completions",
+                        headers=headers,
+                        json={
+                            "model": self._openai_model,
+                            "messages": messages,
+                            "tools": openai_tools,
+                        },
+                        timeout=60.0,
+                    )
+                    resp.raise_for_status()
+                    result = resp.json()
+                except Exception as e:
+                    logger.error(f"[agent] OpenAI API error: {e}")
+                    return {"text": f"Agent error: {e}", "tool_calls": tool_calls_log}
+
+                choice = result.get("choices", [{}])[0]
+                assistant_msg = choice.get("message", {})
+                finish_reason = choice.get("finish_reason", "")
+                content = assistant_msg.get("content") or ""
+                tool_calls = assistant_msg.get("tool_calls") or []
+
+                if not tool_calls:
+                    logger.info(f"[agent] Final response: {content[:100]}")
+                    return {"text": content, "tool_calls": tool_calls_log}
+
+                # Append the full assistant message (with tool_calls) to history
+                messages.append(assistant_msg)
+
+                for tc in tool_calls:
+                    tc_id = tc.get("id", "")
+                    func = tc.get("function", {})
+                    name = func.get("name", "unknown")
+                    raw_args = func.get("arguments", "{}")
+                    try:
+                        args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+                    except json.JSONDecodeError:
+                        args = {}
+
+                    logger.info(
+                        f"[agent] Tool call: {name}"
+                        f"({json.dumps(args, ensure_ascii=False)[:200]})"
+                    )
+                    tool_calls_log.append(name)
+
+                    if name == "geocode":
+                        tool_result = await self._geocode(args.get("query", ""))
+                    else:
+                        handler = self._tool_handlers.get(name)
+                        if handler:
+                            try:
+                                tool_result = handler(args)
+                            except Exception as e:
+                                tool_result = {"error": str(e)}
+                        else:
+                            tool_result = {"error": f"Unknown tool: {name}"}
+
+                    result_str = json.dumps(
+                        tool_result, ensure_ascii=False, default=str
+                    )
+                    logger.info(f"[agent] Tool result: {name} -> {result_str[:200]}")
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tc_id,
+                        "content": result_str,
+                    })
+
+        return {
+            "text": "Tool execution limit reached.",
+            "tool_calls": tool_calls_log,
+        }
+
+    # ──────────────────────────────────────────────
+    # HTTP / SSE server
+    # ──────────────────────────────────────────────
+
+    async def run_sse(self, host: str = "0.0.0.0", port: int = 8765) -> None:
         """Run MCP server with SSE transport."""
         from mcp.server.sse import SseServerTransport
         from starlette.applications import Starlette
         from starlette.routing import Route, Mount
+        from starlette.requests import Request
         from starlette.responses import JSONResponse
         import uvicorn
+        import httpx
 
         sse = SseServerTransport("/messages/")
 
@@ -461,14 +693,198 @@ class AutowareMCPServer:
             state = self._node.get_vehicle_state()
             return JSONResponse({"status": "ok", "connected": state.is_connected})
 
-        app = Starlette(
-            routes=[
-                Route("/health", handle_health),
-                Mount("/sse", app=sse.get_streamable_http_app() if hasattr(sse, 'get_streamable_http_app') else None),
-                Route("/sse", endpoint=handle_sse),
-                Mount("/messages/", app=sse.handle_post_message),
-            ],
-        )
+        async def _nemoclaw_chat(message: str, timeout_s: float = 120.0) -> str:
+            """Send a chat message to NemoClaw via WebSocket and return the response."""
+            import websockets
+
+            logger = self._node.get_logger()
+            gateway_url = self._nemoclaw_ws_url
+            gateway_token = self._nemoclaw_token
+
+            logger.info(f"[chat] Sending to NemoClaw: {message[:80]}")
+            headers = {"Origin": f"http://127.0.0.1:{self._nemoclaw_port}"}
+            async with websockets.connect(gateway_url, additional_headers=headers) as ws:
+                # 1. Wait for challenge
+                await asyncio.wait_for(ws.recv(), timeout=5.0)
+
+                # 2. Connect with auth
+                import uuid as _uuid
+                connect_id = str(_uuid.uuid4())
+                await ws.send(json.dumps({
+                    "type": "req", "id": connect_id,
+                    "method": "connect",
+                    "params": {
+                        "minProtocol": 3, "maxProtocol": 3,
+                        "client": {
+                            "id": "openclaw-control-ui",
+                            "version": "1.0.0",
+                            "platform": "linux",
+                            "mode": "webchat",
+                        },
+                        "role": "operator",
+                        "scopes": ["operator.read", "operator.write"],
+                        "auth": {"token": gateway_token},
+                        "caps": ["tool-events"],
+                    },
+                }))
+
+                # Wait for connect OK
+                connected = False
+                for _ in range(5):
+                    msg = await asyncio.wait_for(ws.recv(), timeout=5.0)
+                    data = json.loads(msg)
+                    if data.get("type") == "res":
+                        if data.get("ok"):
+                            connected = True
+                            logger.info("[chat] WebSocket connected to NemoClaw")
+                            break
+                        else:
+                            err = data.get("error", {}).get("message", "unknown error")
+                            raise ConnectionError(f"NemoClaw connect failed: {err}")
+
+                if not connected:
+                    raise ConnectionError("NemoClaw connect: no response")
+
+                # 3. Send chat message
+                session_key = str(_uuid.uuid4())
+                chat_id = str(_uuid.uuid4())
+                await ws.send(json.dumps({
+                    "type": "req", "id": chat_id,
+                    "method": "chat.send",
+                    "params": {
+                        "sessionKey": session_key,
+                        "message": message,
+                        "deliver": True,
+                        "idempotencyKey": str(_uuid.uuid4()),
+                    },
+                }))
+
+                # 4. Collect streamed response until lifecycle/end or chat/final
+                full_text = ""
+                tool_calls = []
+                deadline = asyncio.get_event_loop().time() + timeout_s
+                while asyncio.get_event_loop().time() < deadline:
+                    remaining = deadline - asyncio.get_event_loop().time()
+                    try:
+                        msg = await asyncio.wait_for(ws.recv(), timeout=min(remaining, 30.0))
+                    except asyncio.TimeoutError:
+                        logger.warn("[chat] Timeout waiting for NemoClaw response")
+                        break
+                    data = json.loads(msg)
+                    if data.get("type") != "event":
+                        continue
+                    payload = data.get("payload", {})
+                    event = data.get("event", "")
+
+                    if event == "agent":
+                        stream = payload.get("stream", "")
+                        pdata = payload.get("data", {})
+                        if stream == "assistant":
+                            delta = pdata.get("delta", "")
+                            if delta:
+                                full_text += delta
+                        elif stream == "tool-call":
+                            tool_name = pdata.get("name", pdata.get("tool", "unknown"))
+                            logger.info(f"[chat] Tool call: {tool_name}")
+                            tool_calls.append(tool_name)
+                        elif stream == "tool-result":
+                            tool_name = pdata.get("name", pdata.get("tool", "unknown"))
+                            status = pdata.get("status", "")
+                            logger.info(f"[chat] Tool result: {tool_name} -> {status}")
+                        elif stream == "lifecycle":
+                            phase = pdata.get("phase", "")
+                            logger.info(f"[chat] Lifecycle: {phase}")
+                            if phase == "end":
+                                break
+                        elif stream == "tool":
+                            phase = pdata.get("phase", "")
+                            name = pdata.get("name", "?")
+                            is_error = pdata.get("isError", False)
+                            if phase == "start":
+                                logger.info(f"[chat] Tool call: {name}({json.dumps(pdata.get('args', {}), ensure_ascii=False)[:200]})")
+                                tool_calls.append(name)
+                            elif phase == "end":
+                                logger.info(f"[chat] Tool done: {name} error={is_error}")
+                        else:
+                            pass  # skip item, status, etc.
+                    elif event == "chat":
+                        state = payload.get("state", "")
+                        if state == "final":
+                            # Extract final text from structured content
+                            msg_obj = payload.get("message", {})
+                            content = msg_obj.get("content", [])
+                            if content and isinstance(content, list):
+                                for part in content:
+                                    if isinstance(part, dict) and part.get("type") == "text":
+                                        full_text = part.get("text", full_text)
+                            logger.info("[chat] Received final response")
+                            break
+                        else:
+                            logger.info(f"[chat] Chat event: state={state}")
+                    elif event == "error":
+                        err_msg = payload.get("message", str(payload))
+                        logger.error(f"[chat] Agent error: {err_msg}")
+                    else:
+                        logger.info(f"[chat] Event: {event} payload_keys={list(payload.keys())}")
+
+                if tool_calls:
+                    logger.info(f"[chat] Tools used: {', '.join(tool_calls)}")
+                logger.info(f"[chat] Response: {full_text[:100]}...")
+                return {"text": full_text, "tool_calls": tool_calls}
+
+        async def handle_chat(request: Request):
+            """Chat handler: uses OpenAI agent with tool calling,
+            falls back to NemoClaw proxy only when API key is missing."""
+            try:
+                body = await request.json()
+            except Exception:
+                return JSONResponse({"error": "invalid JSON"}, status_code=400)
+
+            user_message = body.get("message", "").strip()
+            if not user_message:
+                return JSONResponse({"error": "message is required"}, status_code=400)
+
+            # Primary: OpenAI agent (reliable function calling)
+            if self._openai_api_key:
+                try:
+                    self._node.get_logger().info(
+                        f"[chat] Using OpenAI agent ({self._openai_model})"
+                    )
+                    result = await self._local_agent_chat(user_message)
+                    return JSONResponse({
+                        "response": result["text"],
+                        "tool_calls": result["tool_calls"],
+                    })
+                except Exception as e:
+                    self._node.get_logger().error(f"[chat] OpenAI agent error: {e}")
+                    return JSONResponse(
+                        {"error": f"OpenAI agent error: {e}"}, status_code=502
+                    )
+
+            # Fallback: NemoClaw proxy (only when no API key)
+            self._node.get_logger().info("[chat] No OpenAI key, using NemoClaw proxy")
+            try:
+                result = await _nemoclaw_chat(user_message)
+                return JSONResponse({
+                    "response": result["text"],
+                    "tool_calls": result["tool_calls"],
+                })
+            except ConnectionError as e:
+                return JSONResponse({"error": str(e)}, status_code=502)
+            except Exception as e:
+                self._node.get_logger().error(f"Chat error: {e}")
+                return JSONResponse({"error": f"Chat error: {e}"}, status_code=502)
+
+        routes = [
+            Route("/health", handle_health),
+            Route("/chat", handle_chat, methods=["POST"]),
+            Route("/sse", endpoint=handle_sse),
+            Mount("/messages/", app=sse.handle_post_message),
+        ]
+        if hasattr(sse, 'get_streamable_http_app'):
+            routes.insert(2, Mount("/sse", app=sse.get_streamable_http_app()))
+
+        app = Starlette(routes=routes)
 
         self._node.get_logger().info(f"MCP SSE server starting on {host}:{port}")
         config = uvicorn.Config(app, host=host, port=port, log_level="info")
@@ -492,12 +908,21 @@ def main():
 
     # Read parameters
     node.declare_parameter("transport", "sse")
-    node.declare_parameter("host", "127.0.0.1")
+    node.declare_parameter("host", "0.0.0.0")
     node.declare_parameter("port", 8765)
     node.declare_parameter("map_path", "")
     node.declare_parameter("map_origin_lat", 0.0)
     node.declare_parameter("map_origin_lon", 0.0)
     node.declare_parameter("map_origin_alt", 0.0)
+    # OpenAI-compatible API
+    node.declare_parameter("openai_api_key", "")
+    node.declare_parameter("openai_base_url", "https://api.openai.com/v1")
+    node.declare_parameter("openai_model", "gpt-4.1")
+    # # Ollama (commented out — gemma4 does not support function calling)
+    # node.declare_parameter("ollama_url", "http://127.0.0.1:11435")
+    # node.declare_parameter("ollama_model", "gemma4")
+    node.declare_parameter("nemoclaw_port", 18789)
+    node.declare_parameter("nemoclaw_token", "")
 
     transport = node.get_parameter("transport").get_parameter_value().string_value
     host = node.get_parameter("host").get_parameter_value().string_value
@@ -506,9 +931,52 @@ def main():
     origin_lat = node.get_parameter("map_origin_lat").get_parameter_value().double_value
     origin_lon = node.get_parameter("map_origin_lon").get_parameter_value().double_value
     origin_alt = node.get_parameter("map_origin_alt").get_parameter_value().double_value
+    openai_api_key = node.get_parameter("openai_api_key").get_parameter_value().string_value
+    openai_base_url = node.get_parameter("openai_base_url").get_parameter_value().string_value
+    openai_model = node.get_parameter("openai_model").get_parameter_value().string_value
+    # # Ollama (commented out)
+    # ollama_url = node.get_parameter("ollama_url").get_parameter_value().string_value
+    # ollama_model = node.get_parameter("ollama_model").get_parameter_value().string_value
+    nemoclaw_port = node.get_parameter("nemoclaw_port").get_parameter_value().integer_value
+    nemoclaw_token = node.get_parameter("nemoclaw_token").get_parameter_value().string_value
+
+    # Auto-detect NemoClaw token if not provided
+    if not nemoclaw_token:
+        import subprocess
+        try:
+            result = subprocess.run(
+                ["docker", "exec", "autoware_claw-nemoclaw-1", "python3", "-c",
+                 "import json; print(json.load(open('/sandbox/.openclaw/openclaw.json'))"
+                 ".get('gateway',{}).get('auth',{}).get('token',''))"],
+                capture_output=True, text=True, timeout=5,
+            )
+            nemoclaw_token = result.stdout.strip()
+            if nemoclaw_token:
+                node.get_logger().info("NemoClaw gateway token auto-detected")
+        except Exception:
+            node.get_logger().warn("Could not auto-detect NemoClaw token — chat proxy disabled")
+
+    # Auto-detect OpenAI API key from environment if not set via parameter
+    if not openai_api_key:
+        import os
+        openai_api_key = os.environ.get("OPENAI_API_KEY", "")
+        if openai_api_key:
+            node.get_logger().info("OpenAI API key loaded from OPENAI_API_KEY env var")
+        else:
+            node.get_logger().warn("No OpenAI API key — local agent chat disabled")
 
     # Create MCP server
-    mcp_server = AutowareMCPServer(node)
+    mcp_server = AutowareMCPServer(
+        node,
+        openai_api_key=openai_api_key,
+        openai_base_url=openai_base_url,
+        openai_model=openai_model,
+        # # Ollama (commented out)
+        # ollama_url=ollama_url,
+        # ollama_model=ollama_model,
+        nemoclaw_port=nemoclaw_port,
+        nemoclaw_token=nemoclaw_token,
+    )
     mcp_server.init_coordinate_resolver(map_path, origin_lat, origin_lon, origin_alt)
 
     # Start ROS 2 executor in background thread

@@ -3,11 +3,14 @@
   <arg name="transport" default="sse"/>
   <arg name="port" default="8765"/>
   <arg name="host" default="127.0.0.1"/>
+  <!-- Reads OPENAI_API_KEY from env; falls back to empty string -->
+  <arg name="openai_api_key" default='$(env OPENAI_API_KEY "")'/>
 
   <node pkg="autoware_claw" exec="autoware_mcp_server" name="autoware_mcp_server" output="screen">
     <param from="$(var config_file)"/>
     <param name="transport" value="$(var transport)"/>
     <param name="port" value="$(var port)"/>
     <param name="host" value="$(var host)"/>
+    <param name="openai_api_key" value="$(var openai_api_key)"/>
   </node>
 </launch>

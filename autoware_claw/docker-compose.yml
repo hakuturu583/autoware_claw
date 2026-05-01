@@ -1,98 +1,107 @@
 services:
-  ollama:
-    image: ollama/ollama:latest
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
-    volumes:
-      - ollama-data:/root/.ollama
-    networks:
-      - internal-net
-    healthcheck:
-      # Only healthy once gemma4 model is pulled and ready to serve
-      test: ["CMD-SHELL", "curl -sf http://localhost:11434/api/tags | grep -q gemma4"]
-      interval: 10s
-      timeout: 5s
-      retries: 30
-      start_period: 60s
-    entrypoint: >
-      bash -c "
-        ollama serve &
-        OLLAMA_PID=$$!;
-        for i in $$(seq 1 30); do
-          curl -sf http://localhost:11434/api/tags >/dev/null 2>&1 && break;
-          sleep 2;
-        done;
-        echo '[autoware_claw] Pulling gemma4 model (skipped if already cached in volume)...';
-        ollama pull gemma4;
-        echo '[autoware_claw] gemma4 ready.';
-        wait $$OLLAMA_PID
-      "
+  # # Ollama (commented out — gemma4 does not support function calling;
+  # #         chat agent now uses OpenAI API directly from the host MCP server)
+  # ollama:
+  #   image: ollama/ollama:latest
+  #   deploy:
+  #     resources:
+  #       reservations:
+  #         devices:
+  #           - driver: nvidia
+  #             count: 1
+  #             capabilities: [gpu]
+  #   volumes:
+  #     - ollama-data:/root/.ollama
+  #   ports:
+  #     - "127.0.0.1:11435:11434"
+  #   networks:
+  #     - internal-net
+  #     - host-bridge
+  #   healthcheck:
+  #     test: ["CMD-SHELL", "ollama list | grep -q gemma4"]
+  #     interval: 5s
+  #     timeout: 5s
+  #     retries: 60
+  #     start_period: 10s
 
-  # One-shot service: pull gemma4 weights into ollama-data volume during colcon build.
-  # Uses "setup" profile so it does NOT start with normal `docker compose up`.
-  # No GPU required — just downloads model files.
-  ollama-pull:
-    image: ollama/ollama:latest
-    profiles: ["setup"]
-    volumes:
-      - ollama-data:/root/.ollama
-    entrypoint: >
-      bash -c "
-        ollama serve &
-        for i in $$(seq 1 30); do
-          curl -sf http://localhost:11434/api/tags >/dev/null 2>&1 && break;
-          sleep 2;
-        done;
-        echo '[autoware_claw] Pulling gemma4 into ollama-data volume...';
-        ollama pull gemma4;
-        echo '[autoware_claw] gemma4 cached. Subsequent startups will skip download.';
-      "
+  # # One-shot service: pull gemma4 weights (commented out)
+  # ollama-pull:
+  #   image: ollama/ollama:latest
+  #   profiles: ["setup"]
+  #   volumes:
+  #     - ollama-data:/root/.ollama
+  #   entrypoint: >
+  #     bash -c "
+  #       ollama serve &
+  #       for i in $$(seq 1 30); do
+  #         curl -sf http://localhost:11434/api/tags >/dev/null 2>&1 && break;
+  #         sleep 2;
+  #       done;
+  #       echo '[autoware_claw] Pulling gemma4 into ollama-data volume...';
+  #       ollama pull gemma4;
+  #       echo '[autoware_claw] gemma4 cached. Subsequent startups will skip download.';
+  #     "
 
   nemoclaw:
     image: autoware_claw-nemoclaw:latest
+    tty: true
+    stdin_open: true
+    # Override entrypoint: nemoclaw-start requires capsh/Landlock which may not
+    # be available in all container runtimes. Launch gateway directly instead.
+    entrypoint: ["bash", "-c"]
+    command:
+      - |
+        # Inject Brave API key at runtime (config file is gateway-writable)
+        python3 -c "
+        import json, os
+        cfg_path = '/sandbox/.openclaw/openclaw.json'
+        brave_key = os.environ.get('BRAVE_API_KEY', '')
+        if brave_key:
+            cfg = json.load(open(cfg_path))
+            cfg.setdefault('plugins', {}).setdefault('entries', {}).setdefault('brave', {}).setdefault('config', {}).setdefault('webSearch', {})['apiKey'] = brave_key
+            json.dump(cfg, open(cfg_path, 'w'), indent=2)
+        " 2>/dev/null || true
+        # Start gateway
+        exec openclaw gateway run --port 18789
+    user: gateway
     build:
       context: .
       dockerfile: docker/nemoclaw.Dockerfile
       args:
-        NEMOCLAW_MODEL: gemma4
-        NEMOCLAW_PROVIDER_KEY: ollama
-        NEMOCLAW_PRIMARY_MODEL_REF: gemma4
-        NEMOCLAW_INFERENCE_BASE_URL: "http://ollama:11434/v1"
+        NEMOCLAW_MODEL: gpt-4.1
+        NEMOCLAW_PROVIDER_KEY: openai
+        NEMOCLAW_PRIMARY_MODEL_REF: gpt-4.1
+        NEMOCLAW_INFERENCE_BASE_URL: "https://api.openai.com/v1"
         NEMOCLAW_INFERENCE_API: openai-completions
         NEMOCLAW_DISABLE_DEVICE_AUTH: "1"
         NEMOCLAW_WEB_SEARCH_ENABLED: "1"
         AUTOWARE_MCP_URL: "http://host.docker.internal:8765"
         CHAT_UI_URL: "http://0.0.0.0:18789"
-    depends_on:
-      ollama:
-        condition: service_healthy
+    # # Ollama dependency removed
+    # depends_on:
+    #   ollama:
+    #     condition: service_healthy
     environment:
-      - NEMOCLAW_MODEL_OVERRIDE=gemma4
-      - NEMOCLAW_INFERENCE_API_OVERRIDE=openai-completions
       - BRAVE_API_KEY=${BRAVE_API_KEY:-}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     ports:
       - "127.0.0.1:18789:18789"  # NemoClaw dashboard (localhost only)
     networks:
-      - internal-net    # ollama inference (Docker internal, no internet)
-      - egress-net      # host MCP + web search (internet via NemoClaw L7 policy)
+      - egress-net      # host MCP + OpenAI API + web search
 
-volumes:
-  ollama-data:
+# volumes:
+#   ollama-data:
 
 networks:
-  internal-net:
-    driver: bridge
-    internal: true      # ollama isolated — no external access
+  # # internal-net removed (was only for ollama isolation)
+  # internal-net:
+  #   driver: bridge
+  #   internal: true
+  # host-bridge:
+  #   driver: bridge
   egress-net:
     driver: bridge
-    # NOT internal — NemoClaw needs internet for web search (e.g. Brave)
+    # NOT internal — NemoClaw needs internet for OpenAI API and web search (e.g. Brave)
     # Security is enforced by NemoClaw's L7 network policy, not Docker network.
-    # Allowed endpoints: Brave Search API, host MCP (:8765), etc.
-    # See docker/autoware-overlay/autoware-mcp-policy.yaml
