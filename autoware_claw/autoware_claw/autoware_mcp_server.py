@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """Autoware MCP Server — bridges LLM agents to Autoware via MCP protocol.
 
 Follows the ur5_server.py pattern from ROSClaw: a Server instance registers
@@ -26,10 +27,17 @@ from autoware_claw.types import GEAR_MAP
 class AutowareMCPServer:
     """MCP server exposing Autoware HMI tools to LLM agents."""
 
-    def __init__(self, ros_node: AutowareROSNode) -> None:
+    def __init__(
+        self,
+        ros_node: AutowareROSNode,
+        ollama_url: str = "http://127.0.0.1:11435",
+        ollama_model: str = "gemma4",
+    ) -> None:
         self._node = ros_node
         self._server = Server("rosclaw-autoware-mcp")
         self._coord_resolver: CoordinateResolver | None = None
+        self._ollama_url = ollama_url
+        self._ollama_model = ollama_model
         self._register_tools()
 
     def init_coordinate_resolver(
@@ -439,13 +447,33 @@ class AutowareMCPServer:
     # Server lifecycle
     # ──────────────────────────────────────────────
 
+    def _build_vehicle_context(self) -> str:
+        """Build a system prompt section with current vehicle state."""
+        state = self._node.get_vehicle_state()
+        if not state.is_connected:
+            return "Vehicle status: NOT CONNECTED (no data available)"
+        return (
+            f"Vehicle status (live):\n"
+            f"  Position: x={state.x:.1f}, y={state.y:.1f}, z={state.z:.1f}\n"
+            f"  Orientation: yaw={state.yaw:.3f} rad\n"
+            f"  Speed: {state.velocity_mps:.2f} m/s ({state.velocity_mps * 3.6:.1f} km/h)\n"
+            f"  Steering: {state.steering_tire_angle_rad:.3f} rad\n"
+            f"  Gear: {GEAR_MAP.get(state.gear, 'UNKNOWN')}\n"
+            f"  Operation mode: {state.operation_mode}\n"
+            f"  Autoware control: {'enabled' if state.is_autoware_control_enabled else 'disabled'}\n"
+            f"  Engaged: {'yes' if state.is_engaged else 'no'}\n"
+            f"  MRM: {state.mrm_state}/{state.mrm_behavior}\n"
+        )
+
     async def run_sse(self, host: str = "127.0.0.1", port: int = 8765) -> None:
         """Run MCP server with SSE transport."""
         from mcp.server.sse import SseServerTransport
         from starlette.applications import Starlette
         from starlette.routing import Route, Mount
+        from starlette.requests import Request
         from starlette.responses import JSONResponse
         import uvicorn
+        import httpx
 
         sse = SseServerTransport("/messages/")
 
@@ -461,14 +489,61 @@ class AutowareMCPServer:
             state = self._node.get_vehicle_state()
             return JSONResponse({"status": "ok", "connected": state.is_connected})
 
-        app = Starlette(
-            routes=[
-                Route("/health", handle_health),
-                Mount("/sse", app=sse.get_streamable_http_app() if hasattr(sse, 'get_streamable_http_app') else None),
-                Route("/sse", endpoint=handle_sse),
-                Mount("/messages/", app=sse.handle_post_message),
-            ],
-        )
+        async def handle_chat(request: Request):
+            """Chat proxy: forwards user message to Ollama with vehicle state context."""
+            try:
+                body = await request.json()
+            except Exception:
+                return JSONResponse({"error": "invalid JSON"}, status_code=400)
+
+            user_message = body.get("message", "").strip()
+            if not user_message:
+                return JSONResponse({"error": "message is required"}, status_code=400)
+
+            vehicle_context = self._build_vehicle_context()
+            system_prompt = (
+                "You are an autonomous driving assistant for the Autoware platform. "
+                "You help operators understand vehicle state, diagnose issues, and "
+                "provide guidance on autonomous driving operations.\n\n"
+                f"{vehicle_context}\n"
+                "Answer concisely and accurately based on the vehicle data above."
+            )
+
+            ollama_url = self._ollama_url + "/api/chat"
+            payload = {
+                "model": self._ollama_model,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_message},
+                ],
+                "stream": False,
+            }
+
+            try:
+                async with httpx.AsyncClient(timeout=120.0) as client:
+                    resp = await client.post(ollama_url, json=payload)
+                    resp.raise_for_status()
+                    data = resp.json()
+                    content = data.get("message", {}).get("content", "")
+                    return JSONResponse({"response": content})
+            except httpx.ConnectError:
+                return JSONResponse(
+                    {"error": "Cannot connect to Ollama — is the container running?"},
+                    status_code=502,
+                )
+            except Exception as e:
+                return JSONResponse({"error": str(e)}, status_code=502)
+
+        routes = [
+            Route("/health", handle_health),
+            Route("/chat", handle_chat, methods=["POST"]),
+            Route("/sse", endpoint=handle_sse),
+            Mount("/messages/", app=sse.handle_post_message),
+        ]
+        if hasattr(sse, 'get_streamable_http_app'):
+            routes.insert(2, Mount("/sse", app=sse.get_streamable_http_app()))
+
+        app = Starlette(routes=routes)
 
         self._node.get_logger().info(f"MCP SSE server starting on {host}:{port}")
         config = uvicorn.Config(app, host=host, port=port, log_level="info")
@@ -498,6 +573,8 @@ def main():
     node.declare_parameter("map_origin_lat", 0.0)
     node.declare_parameter("map_origin_lon", 0.0)
     node.declare_parameter("map_origin_alt", 0.0)
+    node.declare_parameter("ollama_url", "http://127.0.0.1:11435")
+    node.declare_parameter("ollama_model", "gemma4")
 
     transport = node.get_parameter("transport").get_parameter_value().string_value
     host = node.get_parameter("host").get_parameter_value().string_value
@@ -506,9 +583,11 @@ def main():
     origin_lat = node.get_parameter("map_origin_lat").get_parameter_value().double_value
     origin_lon = node.get_parameter("map_origin_lon").get_parameter_value().double_value
     origin_alt = node.get_parameter("map_origin_alt").get_parameter_value().double_value
+    ollama_url = node.get_parameter("ollama_url").get_parameter_value().string_value
+    ollama_model = node.get_parameter("ollama_model").get_parameter_value().string_value
 
     # Create MCP server
-    mcp_server = AutowareMCPServer(node)
+    mcp_server = AutowareMCPServer(node, ollama_url=ollama_url, ollama_model=ollama_model)
     mcp_server.init_coordinate_resolver(map_path, origin_lat, origin_lon, origin_alt)
 
     # Start ROS 2 executor in background thread

@@ -30,11 +30,11 @@ namespace autoware_claw_rviz_plugins
 AutowareClawPanel::AutowareClawPanel(QWidget * parent) : rviz_common::Panel(parent)
 {
   // ── Connection settings ──
-  auto * connection_group = new QGroupBox("NemoClaw Gateway");
+  auto * connection_group = new QGroupBox("Autoware CLAW");
   auto * connection_layout = new QHBoxLayout;
 
-  url_input_ = new QLineEdit("http://localhost:18789");
-  url_input_->setPlaceholderText("NemoClaw gateway URL");
+  url_input_ = new QLineEdit("http://localhost:8765");
+  url_input_->setPlaceholderText("MCP server URL");
   status_label_ = new QLabel;
   setConnectionStatus(false);
 
@@ -57,7 +57,7 @@ AutowareClawPanel::AutowareClawPanel(QWidget * parent) : rviz_common::Panel(pare
   // ── Input area ──
   auto * input_layout = new QHBoxLayout;
   message_input_ = new QLineEdit;
-  message_input_->setPlaceholderText("Send a message to OpenClaw...");
+  message_input_->setPlaceholderText("Send a message to Autoware CLAW...");
   send_button_ = new QPushButton("Send");
   send_button_->setDefault(true);
   send_button_->setStyleSheet(
@@ -141,7 +141,7 @@ void AutowareClawPanel::onNetworkReply(QNetworkReply * reply)
 {
   const auto url_path = reply->url().path();
 
-  if (url_path.contains("/health") || url_path.contains("/api/tags")) {
+  if (url_path.contains("/health")) {
     // Health check response
     setConnectionStatus(reply->error() == QNetworkReply::NoError);
     reply->deleteLater();
@@ -238,7 +238,7 @@ void AutowareClawPanel::sendChatRequest(const QString & message)
   QJsonObject body;
   body["message"] = message;
 
-  QNetworkRequest request(QUrl(gateway_url_ + "/api/v1/chat"));
+  QNetworkRequest request(QUrl(gateway_url_ + "/chat"));
   request.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
 
   network_manager_->post(request, QJsonDocument(body).toJson(QJsonDocument::Compact));

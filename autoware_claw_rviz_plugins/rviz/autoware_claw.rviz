@@ -24,7 +24,7 @@ Panels:
     Name: ControlModeDisplay
   - Class: autoware_claw_rviz_plugins::AutowareClawPanel
     Name: AutowareClawPanel
-    gateway_url: "http://localhost:18789"
+    gateway_url: "http://localhost:8765"
 Visualization Manager:
   Class: ""
   Displays:
