@@ -4,6 +4,10 @@
 
 Autoware CLAW lets an LLM agent query vehicle state, resolve GPS coordinates to lane-aligned goals, and send control commands to Autoware — all through a structured MCP tool interface. The agent runs inside an isolated [NemoClaw](https://github.com/NVIDIA/NemoClaw) sandbox with GPU-accelerated inference via [Ollama](https://ollama.com/), while an RViz panel provides an operator chat UI for oversight.
 
+## Demo
+
+[![Autoware CLAW Demo](https://img.youtube.com/vi/nW4TU4qz0LU/0.jpg)](https://www.youtube.com/watch?v=nW4TU4qz0LU)
+
 ## Architecture
 
 ### System Overview
