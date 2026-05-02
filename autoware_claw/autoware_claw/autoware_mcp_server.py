@@ -190,6 +190,24 @@ class AutowareMCPServer:
                     inputSchema={"type": "object", "properties": {}},
                 ),
                 Tool(
+                    name="autoware_set_velocity_limit",
+                    description=(
+                        "Set the maximum velocity limit for autonomous driving. "
+                        "Accepts speed in km/h (converted to m/s internally). "
+                        "The vehicle will not exceed this speed."
+                    ),
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "velocity_kmh": {
+                                "type": "number",
+                                "description": "Maximum velocity in km/h (must be > 0).",
+                            },
+                        },
+                        "required": ["velocity_kmh"],
+                    },
+                ),
+                Tool(
                     name="autoware_set_turn_indicators",
                     description="Set turn indicators: LEFT, RIGHT, or DISABLE.",
                     inputSchema={
@@ -310,6 +328,7 @@ class AutowareMCPServer:
             "autoware_set_goal": self._handle_set_goal,
             "autoware_engage": self._handle_engage,
             "autoware_emergency_stop": self._handle_emergency_stop,
+            "autoware_set_velocity_limit": self._handle_set_velocity_limit,
             "autoware_set_turn_indicators": self._handle_set_turn_indicators,
             "autoware_set_hazard_lights": self._handle_set_hazard_lights,
             "autoware_set_gate_mode": self._handle_set_gate_mode,
@@ -432,6 +451,20 @@ class AutowareMCPServer:
     def _handle_emergency_stop(self, args: dict) -> dict:
         self._node.emergency_stop()
         return {"status": "ok", "message": "Emergency stop triggered"}
+
+    def _handle_set_velocity_limit(self, args: dict) -> dict:
+        velocity_kmh = args["velocity_kmh"]
+        if velocity_kmh <= 0:
+            return {"error": "velocity_kmh must be greater than 0"}
+        velocity_mps = velocity_kmh / 3.6
+        result = self._node.set_velocity_limit(velocity_mps)
+        if not result["success"]:
+            return {"error": result["message"]}
+        return {
+            "status": "ok",
+            "velocity_kmh": velocity_kmh,
+            "velocity_mps": round(velocity_mps, 3),
+        }
 
     def _handle_set_turn_indicators(self, args: dict) -> dict:
         command = args["command"]
