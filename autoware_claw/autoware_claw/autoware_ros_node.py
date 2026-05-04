@@ -29,7 +29,7 @@ from autoware_map_msgs.msg import LaneletMapBin
 from nav_msgs.msg import Odometry
 from tier4_control_msgs.msg import GateMode
 from tier4_external_api_msgs.msg import Heartbeat
-from tier4_external_api_msgs.srv import SetVelocityLimit
+from autoware_internal_planning_msgs.msg import VelocityLimit as VelocityLimitMsg
 
 from autoware_claw.topic_adapters import make_control_msg
 from autoware_claw.types import (
@@ -51,6 +51,12 @@ SENSOR_QOS = QoSProfile(
 RELIABLE_QOS = QoSProfile(
     reliability=ReliabilityPolicy.RELIABLE,
     durability=DurabilityPolicy.VOLATILE,
+    depth=1,
+)
+
+TRANSIENT_LOCAL_QOS = QoSProfile(
+    reliability=ReliabilityPolicy.RELIABLE,
+    durability=DurabilityPolicy.TRANSIENT_LOCAL,
     depth=1,
 )
 
@@ -155,8 +161,10 @@ class AutowareROSNode(Node):
             GateMode, "/control/gate_mode_cmd", RELIABLE_QOS
         )
         self._pub_engage = self.create_publisher(Engage, "/autoware/engage", RELIABLE_QOS)
-        self._cli_velocity_limit = self.create_client(
-            SetVelocityLimit, "/api/autoware/set/velocity_limit"
+        self._pub_velocity_limit = self.create_publisher(
+            VelocityLimitMsg,
+            "/planning/scenario_planning/max_velocity_default",
+            TRANSIENT_LOCAL_QOS,
         )
 
     # ──────────────────────────────────────────────
@@ -398,22 +406,15 @@ class AutowareROSNode(Node):
         self.stop_heartbeat()
         self.get_logger().warn("Emergency stop triggered — heartbeat stopped")
 
-    def set_velocity_limit(self, velocity_mps: float, timeout_sec: float = 5.0) -> dict:
-        """Call /api/autoware/set/velocity_limit service."""
-        if not self._cli_velocity_limit.service_is_ready():
-            self.get_logger().warn("SetVelocityLimit service not available")
-            return {"success": False, "message": "Service not available"}
-        req = SetVelocityLimit.Request()
-        req.velocity = float(velocity_mps)
-        future = self._cli_velocity_limit.call_async(req)
-        deadline = time.time() + timeout_sec
-        while not future.done() and time.time() < deadline:
-            time.sleep(0.05)
-        if future.done() and future.result() is not None:
-            resp = future.result()
-            self.get_logger().info(
-                f"Velocity limit set: {velocity_mps:.2f} m/s "
-                f"({velocity_mps * 3.6:.1f} km/h) success={resp.status.success}"
-            )
-            return {"success": resp.status.success, "message": resp.status.message}
-        return {"success": False, "message": "Service call timed out"}
+    def set_velocity_limit(self, velocity_mps: float) -> None:
+        """Publish velocity limit to /planning/scenario_planning/max_velocity_default."""
+        msg = VelocityLimitMsg()
+        msg.stamp = self.get_clock().now().to_msg()
+        msg.max_velocity = float(velocity_mps)
+        msg.use_constraints = False
+        msg.sender = "mcp"
+        self._pub_velocity_limit.publish(msg)
+        self.get_logger().info(
+            f"Velocity limit set: {velocity_mps:.2f} m/s "
+            f"({velocity_mps * 3.6:.1f} km/h)"
+        )

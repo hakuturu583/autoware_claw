@@ -457,9 +457,7 @@ class AutowareMCPServer:
         if velocity_kmh <= 0:
             return {"error": "velocity_kmh must be greater than 0"}
         velocity_mps = velocity_kmh / 3.6
-        result = self._node.set_velocity_limit(velocity_mps)
-        if not result["success"]:
-            return {"error": result["message"]}
+        self._node.set_velocity_limit(velocity_mps)
         return {
             "status": "ok",
             "velocity_kmh": velocity_kmh,
