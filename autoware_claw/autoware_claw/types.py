@@ -23,6 +23,9 @@ class VehicleState:
     heading_rate_rps: float = 0.0
     steering_tire_angle_rad: float = 0.0
 
+    # Velocity limit
+    current_max_velocity_mps: float = 0.0
+
     # Vehicle status
     gear: int = 0  # GearReport values
     control_mode: int = 0  # ControlModeReport values

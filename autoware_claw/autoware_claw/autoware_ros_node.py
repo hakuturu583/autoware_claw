@@ -136,6 +136,12 @@ class AutowareROSNode(Node):
                 depth=1,
             ),
         )
+        self.create_subscription(
+            VelocityLimitMsg,
+            "/planning/scenario_planning/current_max_velocity",
+            self._on_current_max_velocity,
+            TRANSIENT_LOCAL_QOS,
+        )
 
     # ──────────────────────────────────────────────
     # Publishers
@@ -303,6 +309,10 @@ class AutowareROSNode(Node):
     def _on_engage(self, msg: Engage) -> None:
         with self._lock:
             self._state.is_engaged = msg.engage
+
+    def _on_current_max_velocity(self, msg: VelocityLimitMsg) -> None:
+        with self._lock:
+            self._state.current_max_velocity_mps = msg.max_velocity
 
     def _on_vector_map(self, msg: LaneletMapBin) -> None:
         self.get_logger().info(

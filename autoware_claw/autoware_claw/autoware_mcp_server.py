@@ -344,6 +344,7 @@ class AutowareMCPServer:
         state = self._node.get_vehicle_state()
         d = asdict(state)
         d["gear_name"] = GEAR_MAP.get(state.gear, "UNKNOWN")
+        d["current_max_velocity_kmh"] = round(state.current_max_velocity_mps * 3.6, 1)
         return d
 
     def _handle_get_operation_mode(self, args: dict) -> dict:
@@ -383,6 +384,8 @@ class AutowareMCPServer:
             "operation_mode": state.operation_mode,
             "gear": state.gear,
             "gear_name": GEAR_MAP.get(state.gear, "UNKNOWN"),
+            "current_max_velocity_mps": state.current_max_velocity_mps,
+            "current_max_velocity_kmh": round(state.current_max_velocity_mps * 3.6, 1),
         }
 
     # --- Coordinate resolution tools ---
@@ -518,6 +521,7 @@ class AutowareMCPServer:
             f"  Position: x={state.x:.1f}, y={state.y:.1f}, z={state.z:.1f}\n"
             f"  Orientation: yaw={state.yaw:.3f} rad\n"
             f"  Speed: {state.velocity_mps:.2f} m/s ({state.velocity_mps * 3.6:.1f} km/h)\n"
+            f"  Max velocity limit: {state.current_max_velocity_mps:.2f} m/s ({state.current_max_velocity_mps * 3.6:.1f} km/h)\n"
             f"  Steering: {state.steering_tire_angle_rad:.3f} rad\n"
             f"  Gear: {GEAR_MAP.get(state.gear, 'UNKNOWN')}\n"
             f"  Operation mode: {state.operation_mode}\n"
