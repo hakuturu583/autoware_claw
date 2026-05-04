@@ -66,7 +66,10 @@
     <arg name="rviz_config" value="$(var rviz_config)"/>
   </include>
 
-  <!-- ── 2. Autoware MCP Server ── -->
+  <!-- ── 2. Evaluation adapter (velocity limit service, etc.) ── -->
+  <include file="$(find-pkg-share autoware_evaluation_adapter)/launch/evaluation_adapter.launch.xml"/>
+
+  <!-- ── 3. Autoware MCP Server ── -->
   <group if="$(var launch_claw)">
     <include file="$(find-pkg-share autoware_claw)/launch/mcp_server.launch.xml">
       <arg name="config_file" value="$(var mcp_config_file)"/>
@@ -76,7 +79,7 @@
     </include>
   </group>
 
-  <!-- ── 3. NemoClaw + Ollama Docker containers ── -->
+  <!-- ── 4. NemoClaw + Ollama Docker containers ── -->
   <group if="$(var launch_nemoclaw_docker)">
     <executable
       cmd="docker compose -p autoware_claw -f $(find-pkg-share autoware_claw)/docker/docker-compose.yml up --no-build --abort-on-container-exit"

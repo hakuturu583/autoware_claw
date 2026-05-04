@@ -29,6 +29,7 @@ from autoware_map_msgs.msg import LaneletMapBin
 from nav_msgs.msg import Odometry
 from tier4_control_msgs.msg import GateMode
 from tier4_external_api_msgs.msg import Heartbeat
+from tier4_external_api_msgs.srv import SetVelocityLimit
 from autoware_internal_planning_msgs.msg import VelocityLimit as VelocityLimitMsg
 
 from autoware_claw.topic_adapters import make_control_msg
@@ -171,6 +172,9 @@ class AutowareROSNode(Node):
             VelocityLimitMsg,
             "/planning/scenario_planning/max_velocity_default",
             TRANSIENT_LOCAL_QOS,
+        )
+        self._cli_velocity_limit = self.create_client(
+            SetVelocityLimit, "/api/autoware/set/velocity_limit"
         )
 
     # ──────────────────────────────────────────────
@@ -416,8 +420,24 @@ class AutowareROSNode(Node):
         self.stop_heartbeat()
         self.get_logger().warn("Emergency stop triggered — heartbeat stopped")
 
-    def set_velocity_limit(self, velocity_mps: float) -> None:
-        """Publish velocity limit to /planning/scenario_planning/max_velocity_default."""
+    def set_velocity_limit(self, velocity_mps: float, timeout_sec: float = 5.0) -> None:
+        """Set velocity limit via service if available, otherwise fall back to topic publish."""
+        if self._cli_velocity_limit.service_is_ready():
+            req = SetVelocityLimit.Request()
+            req.velocity = float(velocity_mps)
+            future = self._cli_velocity_limit.call_async(req)
+            deadline = time.time() + timeout_sec
+            while not future.done() and time.time() < deadline:
+                time.sleep(0.05)
+            if future.done() and future.result() is not None:
+                resp = future.result()
+                self.get_logger().info(
+                    f"Velocity limit set via service: {velocity_mps:.2f} m/s "
+                    f"({velocity_mps * 3.6:.1f} km/h) success={resp.status.success}"
+                )
+                return
+            self.get_logger().warn("Service call timed out, falling back to topic publish")
+
         msg = VelocityLimitMsg()
         msg.stamp = self.get_clock().now().to_msg()
         msg.max_velocity = float(velocity_mps)
@@ -425,6 +445,6 @@ class AutowareROSNode(Node):
         msg.sender = "mcp"
         self._pub_velocity_limit.publish(msg)
         self.get_logger().info(
-            f"Velocity limit set: {velocity_mps:.2f} m/s "
+            f"Velocity limit set via topic: {velocity_mps:.2f} m/s "
             f"({velocity_mps * 3.6:.1f} km/h)"
         )
