@@ -25,6 +25,7 @@ class VehicleState:
 
     # Velocity limit
     current_max_velocity_mps: float = 0.0
+    current_max_velocity_sender: str = ""
 
     # Vehicle status
     gear: int = 0  # GearReport values

@@ -30,7 +30,6 @@ from nav_msgs.msg import Odometry
 from tier4_control_msgs.msg import GateMode
 from tier4_external_api_msgs.msg import Heartbeat
 from autoware_internal_planning_msgs.msg import VelocityLimit as VelocityLimitMsg
-from autoware_internal_debug_msgs.msg import StringStamped
 
 from autoware_claw.topic_adapters import make_control_msg
 from autoware_claw.types import (
@@ -82,7 +81,6 @@ class AutowareROSNode(Node):
         self._heartbeat_active = False
         self._vector_map_bin: bytes | None = None
         self._on_vector_map_callback = None
-        self._velocity_limit_table_debug: str = ""
 
         self._setup_subscribers()
         self._setup_publishers()
@@ -143,16 +141,6 @@ class AutowareROSNode(Node):
             "/planning/scenario_planning/current_max_velocity",
             self._on_current_max_velocity,
             TRANSIENT_LOCAL_QOS,
-        )
-        self.create_subscription(
-            StringStamped,
-            "/planning/scenario_planning/external_velocity_limit_selector/debug",
-            self._on_velocity_limit_debug,
-            QoSProfile(
-                reliability=ReliabilityPolicy.RELIABLE,
-                durability=DurabilityPolicy.VOLATILE,
-                depth=1,
-            ),
         )
 
     # ──────────────────────────────────────────────
@@ -325,10 +313,7 @@ class AutowareROSNode(Node):
     def _on_current_max_velocity(self, msg: VelocityLimitMsg) -> None:
         with self._lock:
             self._state.current_max_velocity_mps = msg.max_velocity
-
-    def _on_velocity_limit_debug(self, msg: StringStamped) -> None:
-        with self._lock:
-            self._velocity_limit_table_debug = msg.data
+            self._state.current_max_velocity_sender = msg.sender
 
     def _on_vector_map(self, msg: LaneletMapBin) -> None:
         self.get_logger().info(
@@ -445,30 +430,3 @@ class AutowareROSNode(Node):
             f"({velocity_mps * 3.6:.1f} km/h)"
         )
 
-    def get_velocity_limit_table_debug(self) -> str:
-        """Return the raw debug string from external_velocity_limit_selector."""
-        with self._lock:
-            return self._velocity_limit_table_debug
-
-    def parse_velocity_limit_table(self) -> list[dict]:
-        """Parse the debug string into a list of velocity limit entries.
-
-        Debug format: [sender](use_constraints,max_velocity,min_accel,min_jerk,max_jerk)
-        """
-        import re
-
-        raw = self.get_velocity_limit_table_debug()
-        if not raw:
-            return []
-        entries = []
-        for match in re.finditer(
-            r"\[([^\]]+)\]\(([^,]+),([^,]+),([^,]+),([^,]+),([^)]+)\)", raw
-        ):
-            sender = match.group(1)
-            max_vel = float(match.group(3))
-            entries.append({
-                "sender": sender,
-                "max_velocity_mps": round(max_vel, 3),
-                "max_velocity_kmh": round(max_vel * 3.6, 1),
-            })
-        return entries

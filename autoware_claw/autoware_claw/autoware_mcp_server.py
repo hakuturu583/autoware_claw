@@ -527,6 +527,7 @@ class AutowareMCPServer:
         state = self._node.get_vehicle_state()
         effective_mps = state.current_max_velocity_mps
         effective_kmh = round(effective_mps * 3.6, 1)
+        effective_sender = state.current_max_velocity_sender
         current_speed_kmh = round(state.velocity_mps * 3.6, 1)
 
         result = {
@@ -547,37 +548,19 @@ class AutowareMCPServer:
                 "due to route planning, curves, or approaching the goal."
             )
         elif effective_mps > 0 and effective_mps < velocity_mps:
-            # Effective limit is lower than requested — find blockers
             result["success"] = False
-            table = self._node.parse_velocity_limit_table()
-            blockers = [
-                e for e in table
-                if e["sender"] != "api" and e["max_velocity_mps"] < velocity_mps
-            ]
-            if blockers:
-                blocker_descs = [
-                    f"{b['sender']}({b['max_velocity_kmh']}km/h)"
-                    for b in blockers
-                ]
-                result["reason"] = (
-                    f"The requested {velocity_kmh} km/h was set, but the "
-                    f"effective limit is {effective_kmh} km/h because the "
-                    f"following safety modules impose lower limits: "
-                    f"{', '.join(blocker_descs)}."
-                )
-            else:
-                result["reason"] = (
-                    f"The requested {velocity_kmh} km/h was set, but the "
-                    f"effective limit is {effective_kmh} km/h. "
-                    f"Another planning module may be constraining the speed."
-                )
+            result["constrained_by"] = effective_sender
+            result["reason"] = (
+                f"Velocity limit was set to {velocity_kmh} km/h, but "
+                f"'{effective_sender}' is enforcing a lower limit of "
+                f"{effective_kmh} km/h. The vehicle cannot exceed "
+                f"{effective_kmh} km/h until this constraint is resolved."
+            )
         elif effective_mps == 0.0:
-            # No feedback received
             result["success"] = None
             result["reason"] = (
                 f"Velocity limit command sent ({velocity_kmh} km/h), but "
-                f"could not verify the result. The current_max_velocity "
-                f"feedback topic may not be available."
+                f"could not verify — no feedback from the planning system yet."
             )
         else:
             result["success"] = True
@@ -588,13 +571,12 @@ class AutowareMCPServer:
         return result
 
     def _handle_get_velocity_limits(self, args: dict) -> dict:
-        table = self._node.parse_velocity_limit_table()
         state = self._node.get_vehicle_state()
         return {
-            "entries": table,
             "effective_limit_mps": state.current_max_velocity_mps,
             "effective_limit_kmh": round(state.current_max_velocity_mps * 3.6, 1),
-            "note": "The effective limit is the minimum across all entries.",
+            "constrained_by": state.current_max_velocity_sender,
+            "current_speed_kmh": round(state.velocity_mps * 3.6, 1),
         }
 
     def _handle_set_turn_indicators(self, args: dict) -> dict:
