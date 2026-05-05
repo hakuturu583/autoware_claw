@@ -94,7 +94,7 @@ class AutowareMCPServer:
                 # Display tools
                 Tool(
                     name="autoware_get_vehicle_state",
-                    description="Get current vehicle state: position, velocity, steering, gear, and system status.",
+                    description="Get current vehicle state: position, velocity, steering, gear, system status, and current_max_velocity_mps (effective velocity limit from planning).",
                     inputSchema={"type": "object", "properties": {}},
                 ),
                 Tool(
@@ -194,7 +194,10 @@ class AutowareMCPServer:
                     description=(
                         "Set the maximum velocity limit for autonomous driving. "
                         "Accepts speed in km/h (converted to m/s internally). "
-                        "The vehicle will not exceed this speed."
+                        "The vehicle will not exceed this speed. "
+                        "Default limit is about 72 km/h (20 m/s). "
+                        "The response includes the current effective limit from the planning system. "
+                        "Use autoware_get_vehicle_state to check current_max_velocity_mps."
                     ),
                     inputSchema={
                         "type": "object",
@@ -461,10 +464,15 @@ class AutowareMCPServer:
             return {"error": "velocity_kmh must be greater than 0"}
         velocity_mps = velocity_kmh / 3.6
         self._node.set_velocity_limit(velocity_mps)
+        import time
+        time.sleep(0.5)
+        state = self._node.get_vehicle_state()
         return {
             "status": "ok",
-            "velocity_kmh": velocity_kmh,
-            "velocity_mps": round(velocity_mps, 3),
+            "requested_velocity_kmh": velocity_kmh,
+            "requested_velocity_mps": round(velocity_mps, 3),
+            "current_effective_limit_mps": state.current_max_velocity_mps,
+            "current_effective_limit_kmh": round(state.current_max_velocity_mps * 3.6, 1),
         }
 
     def _handle_set_turn_indicators(self, args: dict) -> dict:
