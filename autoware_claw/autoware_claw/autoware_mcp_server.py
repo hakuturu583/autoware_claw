@@ -128,7 +128,7 @@ class AutowareMCPServer:
                 # Coordinate resolution tools
                 Tool(
                     name="autoware_resolve_goal",
-                    description="Convert lat/lon to lane-aligned goal candidates. Returns poses on lane centerlines near the specified GPS coordinate.",
+                    description="Convert lat/lon to lane-aligned goal candidates. Returns poses on lane centerlines near the specified GPS coordinate. Automatically tries larger search radii (up to 500m) if no candidates found. If still empty, returns diagnostics including nearest road distance to help determine if the map covers the area.",
                     inputSchema={
                         "type": "object",
                         "properties": {
@@ -194,10 +194,8 @@ class AutowareMCPServer:
                     description=(
                         "Set the maximum velocity limit for autonomous driving. "
                         "Accepts speed in km/h (converted to m/s internally). "
-                        "The vehicle will not exceed this speed. "
-                        "Default limit is about 72 km/h (20 m/s). "
-                        "The response includes the current effective limit from the planning system. "
-                        "Use autoware_get_vehicle_state to check current_max_velocity_mps."
+                        "Multiple modules can set velocity limits — the lowest always wins. "
+                        "The response will indicate if another module is imposing a lower limit."
                     ),
                     inputSchema={
                         "type": "object",
@@ -209,6 +207,15 @@ class AutowareMCPServer:
                         },
                         "required": ["velocity_kmh"],
                     },
+                ),
+                Tool(
+                    name="autoware_get_velocity_limits",
+                    description=(
+                        "Get all active velocity limit entries from the velocity limit selector. "
+                        "Shows which modules are setting limits and their values. "
+                        "The effective limit is the minimum across all entries."
+                    ),
+                    inputSchema={"type": "object", "properties": {}},
                 ),
                 Tool(
                     name="autoware_set_turn_indicators",
@@ -332,6 +339,7 @@ class AutowareMCPServer:
             "autoware_engage": self._handle_engage,
             "autoware_emergency_stop": self._handle_emergency_stop,
             "autoware_set_velocity_limit": self._handle_set_velocity_limit,
+            "autoware_get_velocity_limits": self._handle_get_velocity_limits,
             "autoware_set_turn_indicators": self._handle_set_turn_indicators,
             "autoware_set_hazard_lights": self._handle_set_hazard_lights,
             "autoware_set_gate_mode": self._handle_set_gate_mode,
@@ -398,11 +406,57 @@ class AutowareMCPServer:
             return {"error": "Coordinate resolver not initialized (no map loaded)"}
         lat = args["lat"]
         lon = args["lon"]
-        radius = args.get("search_radius", 50.0)
-        candidates = self._coord_resolver.resolve_goal(lat, lon, search_radius=radius)
-        return {
+        initial_radius = args.get("search_radius", 50.0)
+
+        # Project GPS to map coordinates for diagnostics
+        map_x, map_y, map_z = self._coord_resolver.project_gps(lat, lon)
+
+        # Progressive radius escalation: try increasing radii
+        search_radii = [initial_radius]
+        for r in [100.0, 200.0, 500.0]:
+            if r > initial_radius:
+                search_radii.append(r)
+
+        candidates = []
+        used_radius = initial_radius
+        for radius in search_radii:
+            candidates = self._coord_resolver.resolve_goal(
+                lat, lon, search_radius=radius
+            )
+            used_radius = radius
+            if candidates:
+                break
+
+        result = {
             "candidates": [asdict(c) for c in candidates],
+            "map_coordinates": {"x": round(map_x, 3), "y": round(map_y, 3)},
+            "search_radius_used": used_radius,
         }
+
+        if not candidates:
+            # Diagnostics: why no candidates?
+            nearest_dist = self._coord_resolver.find_nearest_road_distance(
+                map_x, map_y
+            )
+            result["diagnostics"] = {
+                "road_lanelet_count": self._coord_resolver.road_lanelet_count,
+                "nearest_road_distance_m": (
+                    round(nearest_dist, 1) if nearest_dist is not None else None
+                ),
+                "hint": (
+                    "The loaded map may not cover this GPS location. "
+                    "The nearest road lanelet is "
+                    + (
+                        f"{nearest_dist:.0f}m away"
+                        if nearest_dist is not None
+                        else "not found within 5km"
+                    )
+                    + f" (searched up to {used_radius}m radius). "
+                    "Check that the map covers the target area."
+                ),
+            }
+
+        return result
 
     def _handle_get_lane_info(self, args: dict) -> dict:
         if self._coord_resolver is None:
@@ -463,16 +517,52 @@ class AutowareMCPServer:
         if velocity_kmh <= 0:
             return {"error": "velocity_kmh must be greater than 0"}
         velocity_mps = velocity_kmh / 3.6
+
         self._node.set_velocity_limit(velocity_mps)
-        import time
-        time.sleep(0.5)
-        state = self._node.get_vehicle_state()
-        return {
+
+        # Check if other modules impose a lower limit
+        table = self._node.parse_velocity_limit_table()
+        blockers = [
+            e for e in table
+            if e["sender"] != "api" and e["max_velocity_mps"] < velocity_mps
+        ]
+
+        result = {
             "status": "ok",
             "requested_velocity_kmh": velocity_kmh,
             "requested_velocity_mps": round(velocity_mps, 3),
-            "current_effective_limit_mps": state.current_max_velocity_mps,
-            "current_effective_limit_kmh": round(state.current_max_velocity_mps * 3.6, 1),
+        }
+
+        if blockers:
+            blocker_descs = [
+                f"{b['sender']} ({b['max_velocity_kmh']} km/h)"
+                for b in blockers
+            ]
+            result["warning"] = (
+                f"Velocity limit was set to {velocity_kmh} km/h, but the following "
+                f"modules impose lower limits: {', '.join(blocker_descs)}. "
+                f"The effective speed will be limited to the lowest value. "
+                f"Tell the user that the requested limit was set, but the vehicle "
+                f"cannot go that fast due to these safety constraints."
+            )
+            result["effective_limit_kmh"] = min(
+                b["max_velocity_kmh"] for b in blockers
+            )
+        else:
+            result["message"] = (
+                f"Velocity limit set to {velocity_kmh} km/h ({velocity_mps:.3f} m/s)."
+            )
+
+        return result
+
+    def _handle_get_velocity_limits(self, args: dict) -> dict:
+        table = self._node.parse_velocity_limit_table()
+        state = self._node.get_vehicle_state()
+        return {
+            "entries": table,
+            "effective_limit_mps": state.current_max_velocity_mps,
+            "effective_limit_kmh": round(state.current_max_velocity_mps * 3.6, 1),
+            "note": "The effective limit is the minimum across all entries.",
         }
 
     def _handle_set_turn_indicators(self, args: dict) -> dict:
@@ -561,6 +651,7 @@ class AutowareMCPServer:
                     params={
                         "address": query,
                         "language": "ja",
+                        "region": "jp",
                         "key": self._google_maps_api_key,
                     },
                 )
