@@ -146,7 +146,7 @@ class AutowareROSNode(Node):
         )
         self.create_subscription(
             StringStamped,
-            "/planning/scenario_planning/external_velocity_limit_selector/output/debug",
+            "/planning/scenario_planning/external_velocity_limit_selector/debug",
             self._on_velocity_limit_debug,
             QoSProfile(
                 reliability=ReliabilityPolicy.RELIABLE,

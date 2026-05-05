@@ -520,6 +520,16 @@ class AutowareMCPServer:
 
         self._node.set_velocity_limit(velocity_mps)
 
+        state = self._node.get_vehicle_state()
+        current_speed_kmh = round(state.velocity_mps * 3.6, 1)
+
+        result = {
+            "status": "ok",
+            "requested_velocity_kmh": velocity_kmh,
+            "requested_velocity_mps": round(velocity_mps, 3),
+            "current_speed_kmh": current_speed_kmh,
+        }
+
         # Check if other modules impose a lower limit
         table = self._node.parse_velocity_limit_table()
         blockers = [
@@ -527,30 +537,24 @@ class AutowareMCPServer:
             if e["sender"] != "api" and e["max_velocity_mps"] < velocity_mps
         ]
 
-        result = {
-            "status": "ok",
-            "requested_velocity_kmh": velocity_kmh,
-            "requested_velocity_mps": round(velocity_mps, 3),
-        }
-
         if blockers:
             blocker_descs = [
                 f"{b['sender']} ({b['max_velocity_kmh']} km/h)"
                 for b in blockers
             ]
+            effective = min(b["max_velocity_kmh"] for b in blockers)
             result["warning"] = (
                 f"Velocity limit was set to {velocity_kmh} km/h, but the following "
-                f"modules impose lower limits: {', '.join(blocker_descs)}. "
-                f"The effective speed will be limited to the lowest value. "
-                f"Tell the user that the requested limit was set, but the vehicle "
-                f"cannot go that fast due to these safety constraints."
+                f"safety modules impose lower limits: {', '.join(blocker_descs)}. "
+                f"The vehicle will not exceed {effective} km/h due to these constraints. "
+                f"Tell the user that the limit was set but cannot take full effect."
             )
-            result["effective_limit_kmh"] = min(
-                b["max_velocity_kmh"] for b in blockers
-            )
+            result["effective_limit_kmh"] = effective
         else:
-            result["message"] = (
-                f"Velocity limit set to {velocity_kmh} km/h ({velocity_mps:.3f} m/s)."
+            result["note"] = (
+                "This sets a maximum speed ceiling. "
+                "The vehicle may drive slower due to route planning, "
+                "curves, traffic, or approaching the goal."
             )
 
         return result
