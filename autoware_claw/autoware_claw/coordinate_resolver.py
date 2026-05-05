@@ -127,6 +127,52 @@ class CoordinateResolver:
         candidates.sort(key=lambda c: c.lateral_dist_m)
         return candidates[:max_candidates]
 
+    def project_gps(self, lat: float, lon: float) -> tuple[float, float, float]:
+        """Project lat/lon to map frame coordinates.
+
+        Returns:
+            (x, y, z) in map frame.
+        """
+        gps_point = lanelet2.core.GPSPoint(lat, lon, 0.0)
+        p = self._projector.forward(gps_point)
+        return (p.x, p.y, p.z)
+
+    def find_nearest_road_distance(self, x: float, y: float) -> Optional[float]:
+        """Find approximate distance to the nearest road lanelet from map coordinates.
+
+        Uses progressively larger search radii to efficiently find the nearest
+        road lanelet without scanning all lanelets.
+
+        Returns:
+            Approximate distance in meters, or None if no road lanelets within 5km.
+        """
+        if not self._road_lanelets:
+            return None
+        search_point = lanelet2.core.BasicPoint2d(x, y)
+        for probe_radius in [100.0, 500.0, 1000.0, 2000.0, 5000.0]:
+            nearby = getLaneletsWithinRange(
+                self._road_lanelets, search_point, probe_radius
+            )
+            if nearby:
+                # Found lanelets — compute actual min distance to centerlines
+                min_dist = float("inf")
+                for ll in nearby:
+                    cl = ll.centerline
+                    for i in range(len(cl)):
+                        pt = cl[i]
+                        dx = pt.x - x
+                        dy = pt.y - y
+                        d = math.sqrt(dx * dx + dy * dy)
+                        if d < min_dist:
+                            min_dist = d
+                return min_dist
+        return None
+
+    @property
+    def road_lanelet_count(self) -> int:
+        """Number of road lanelets in the loaded map."""
+        return len(self._road_lanelets)
+
     def get_lane_info(
         self,
         x: float,

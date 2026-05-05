@@ -29,6 +29,7 @@ from autoware_map_msgs.msg import LaneletMapBin
 from nav_msgs.msg import Odometry
 from tier4_control_msgs.msg import GateMode
 from tier4_external_api_msgs.msg import Heartbeat
+from autoware_internal_planning_msgs.msg import VelocityLimit as VelocityLimitMsg
 
 from autoware_claw.topic_adapters import make_control_msg
 from autoware_claw.types import (
@@ -50,6 +51,12 @@ SENSOR_QOS = QoSProfile(
 RELIABLE_QOS = QoSProfile(
     reliability=ReliabilityPolicy.RELIABLE,
     durability=DurabilityPolicy.VOLATILE,
+    depth=1,
+)
+
+TRANSIENT_LOCAL_QOS = QoSProfile(
+    reliability=ReliabilityPolicy.RELIABLE,
+    durability=DurabilityPolicy.TRANSIENT_LOCAL,
     depth=1,
 )
 
@@ -129,6 +136,12 @@ class AutowareROSNode(Node):
                 depth=1,
             ),
         )
+        self.create_subscription(
+            VelocityLimitMsg,
+            "/planning/scenario_planning/current_max_velocity",
+            self._on_current_max_velocity,
+            TRANSIENT_LOCAL_QOS,
+        )
 
     # ──────────────────────────────────────────────
     # Publishers
@@ -154,6 +167,11 @@ class AutowareROSNode(Node):
             GateMode, "/control/gate_mode_cmd", RELIABLE_QOS
         )
         self._pub_engage = self.create_publisher(Engage, "/autoware/engage", RELIABLE_QOS)
+        self._pub_velocity_limit = self.create_publisher(
+            VelocityLimitMsg,
+            "/planning/scenario_planning/max_velocity_default",
+            TRANSIENT_LOCAL_QOS,
+        )
 
     # ──────────────────────────────────────────────
     # Heartbeat
@@ -292,6 +310,11 @@ class AutowareROSNode(Node):
         with self._lock:
             self._state.is_engaged = msg.engage
 
+    def _on_current_max_velocity(self, msg: VelocityLimitMsg) -> None:
+        with self._lock:
+            self._state.current_max_velocity_mps = msg.max_velocity
+            self._state.current_max_velocity_sender = msg.sender
+
     def _on_vector_map(self, msg: LaneletMapBin) -> None:
         self.get_logger().info(
             f"Received vector map ({len(msg.data)} bytes)"
@@ -393,3 +416,17 @@ class AutowareROSNode(Node):
         self.send_control(steering_rad=0.0, velocity_mps=0.0, acceleration_mps2=-2.5)
         self.stop_heartbeat()
         self.get_logger().warn("Emergency stop triggered — heartbeat stopped")
+
+    def set_velocity_limit(self, velocity_mps: float) -> None:
+        """Set velocity limit by publishing to max_velocity_default topic."""
+        msg = VelocityLimitMsg()
+        msg.stamp = self.get_clock().now().to_msg()
+        msg.max_velocity = float(velocity_mps)
+        msg.use_constraints = False
+        msg.sender = "mcp"
+        self._pub_velocity_limit.publish(msg)
+        self.get_logger().info(
+            f"Velocity limit set: {velocity_mps:.2f} m/s "
+            f"({velocity_mps * 3.6:.1f} km/h)"
+        )
+
