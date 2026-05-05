@@ -520,41 +520,69 @@ class AutowareMCPServer:
 
         self._node.set_velocity_limit(velocity_mps)
 
+        # Wait for the system to process and update feedback
+        import time
+        time.sleep(0.5)
+
         state = self._node.get_vehicle_state()
+        effective_mps = state.current_max_velocity_mps
+        effective_kmh = round(effective_mps * 3.6, 1)
         current_speed_kmh = round(state.velocity_mps * 3.6, 1)
 
         result = {
-            "status": "ok",
             "requested_velocity_kmh": velocity_kmh,
             "requested_velocity_mps": round(velocity_mps, 3),
+            "effective_limit_kmh": effective_kmh,
+            "effective_limit_mps": round(effective_mps, 3),
             "current_speed_kmh": current_speed_kmh,
         }
 
-        # Check if other modules impose a lower limit
-        table = self._node.parse_velocity_limit_table()
-        blockers = [
-            e for e in table
-            if e["sender"] != "api" and e["max_velocity_mps"] < velocity_mps
-        ]
-
-        if blockers:
-            blocker_descs = [
-                f"{b['sender']} ({b['max_velocity_kmh']} km/h)"
-                for b in blockers
-            ]
-            effective = min(b["max_velocity_kmh"] for b in blockers)
-            result["warning"] = (
-                f"Velocity limit was set to {velocity_kmh} km/h, but the following "
-                f"safety modules impose lower limits: {', '.join(blocker_descs)}. "
-                f"The vehicle will not exceed {effective} km/h due to these constraints. "
-                f"Tell the user that the limit was set but cannot take full effect."
+        # Determine success/failure
+        tolerance_mps = 0.5
+        if abs(effective_mps - velocity_mps) < tolerance_mps:
+            result["success"] = True
+            result["message"] = (
+                f"Velocity limit successfully set to {velocity_kmh} km/h. "
+                "This is a maximum ceiling — the vehicle may drive slower "
+                "due to route planning, curves, or approaching the goal."
             )
-            result["effective_limit_kmh"] = effective
+        elif effective_mps > 0 and effective_mps < velocity_mps:
+            # Effective limit is lower than requested — find blockers
+            result["success"] = False
+            table = self._node.parse_velocity_limit_table()
+            blockers = [
+                e for e in table
+                if e["sender"] != "api" and e["max_velocity_mps"] < velocity_mps
+            ]
+            if blockers:
+                blocker_descs = [
+                    f"{b['sender']}({b['max_velocity_kmh']}km/h)"
+                    for b in blockers
+                ]
+                result["reason"] = (
+                    f"The requested {velocity_kmh} km/h was set, but the "
+                    f"effective limit is {effective_kmh} km/h because the "
+                    f"following safety modules impose lower limits: "
+                    f"{', '.join(blocker_descs)}."
+                )
+            else:
+                result["reason"] = (
+                    f"The requested {velocity_kmh} km/h was set, but the "
+                    f"effective limit is {effective_kmh} km/h. "
+                    f"Another planning module may be constraining the speed."
+                )
+        elif effective_mps == 0.0:
+            # No feedback received
+            result["success"] = None
+            result["reason"] = (
+                f"Velocity limit command sent ({velocity_kmh} km/h), but "
+                f"could not verify the result. The current_max_velocity "
+                f"feedback topic may not be available."
+            )
         else:
-            result["note"] = (
-                "This sets a maximum speed ceiling. "
-                "The vehicle may drive slower due to route planning, "
-                "curves, traffic, or approaching the goal."
+            result["success"] = True
+            result["message"] = (
+                f"Velocity limit set. Effective limit is {effective_kmh} km/h."
             )
 
         return result
